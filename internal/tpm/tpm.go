@@ -122,7 +122,7 @@ func (Sealer) Seal(secret []byte) ([]byte, error) {
 func (Sealer) Unseal(blob []byte) ([]byte, error) {
 	pubBytes, privBytes, err := decodeBlob(blob)
 	if err != nil {
-		return nil, err
+		return nil, err // decodeBlob says which part is truncated
 	}
 	pub, err := tpm2.Unmarshal[tpm2.TPM2BPublic](pubBytes)
 	if err != nil {
@@ -164,7 +164,7 @@ func (Sealer) Unseal(blob []byte) ([]byte, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, err // every step inside withPrimary names itself
 	}
 	return secret, nil
 }

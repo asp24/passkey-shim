@@ -23,7 +23,7 @@ var _ hidbridge.Device = (*Device)(nil)
 func Open(uniq string) (*Device, error) {
 	dev, err := uhid.Open()
 	if err != nil {
-		return nil, err
+		return nil, err // names /dev/uhid and, if missing, the module to load
 	}
 	return &Device{dev: dev, uniq: uniq}, nil
 }
@@ -33,7 +33,7 @@ func Open(uniq string) (*Device, error) {
 func Check() error {
 	dev, err := uhid.Open()
 	if err != nil {
-		return err
+		return err // names /dev/uhid and, if missing, the module to load
 	}
 	return dev.Close()
 }

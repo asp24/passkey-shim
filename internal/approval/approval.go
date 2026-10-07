@@ -71,7 +71,7 @@ func (m *Menu) Confirm(ctx context.Context, title string, choices []string) (str
 			}
 			return "", nil
 		}
-		return "", err
+		return "", fmt.Errorf("running approval prompt: %w", err)
 	}
 	// Options may carry a tab-separated subtext; the label is the first field.
 	choice := strings.TrimSpace(string(out))

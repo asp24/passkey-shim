@@ -54,7 +54,7 @@ func serve(ctx context.Context, uid int, log *zap.Logger, checkDevice func() err
 	// systemd creates the root-owned runtime directory.
 	listener, err := hidbridge.Listen(hidbridge.SocketPath(uid), uid)
 	if err != nil {
-		return err
+		return err // Listen names the socket and the failed step
 	}
 	defer listener.Close()
 	log.Info("listening", zap.String("socket", hidbridge.SocketPath(uid)))

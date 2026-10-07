@@ -129,7 +129,7 @@ func (s *Server) relay(conn *net.UnixConn) error {
 	// The client connects before unlocking its vault but asks for the device
 	// only afterwards, so a locked authenticator never shows up in browsers.
 	if err := awaitCreate(conn); err != nil {
-		return err
+		return err // awaitCreate names the failed step
 	}
 	if err := dev.Create(); err != nil {
 		return fmt.Errorf("creating device: %w", err)
@@ -196,7 +196,7 @@ func forwardEvents(conn *net.UnixConn, dev Device) error {
 		}
 		packet, err := encodeEvent(ev)
 		if err != nil {
-			return err
+			return fmt.Errorf("encoding device event: %w", err)
 		}
 		if _, err := conn.Write(packet); err != nil {
 			return fmt.Errorf("forwarding event: %w", err)

@@ -506,7 +506,7 @@ func (a *Authenticator) attestedCredentialData(credID []byte, priv *ecdsa.Privat
 	}
 	coseBytes, err := ctapEncMode.Marshal(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encoding COSE key: %w", err)
 	}
 
 	out := make([]byte, 0, 16+2+len(credID)+len(coseBytes))

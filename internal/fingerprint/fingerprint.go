@@ -63,7 +63,7 @@ func New(prompter Prompter, log *zap.Logger) (*Verifier, error) {
 	}
 	devPath, err := defaultDevice(conn)
 	if err != nil {
-		return nil, err
+		return nil, err // wraps ErrUnavailable with the D-Bus cause
 	}
 	dev := conn.Object(fprintService, devPath)
 	var fingers []string
@@ -98,7 +98,7 @@ func (fv *Verifier) Verify(ctx context.Context, reason string) (bool, error) {
 
 	devPath, err := defaultDevice(conn)
 	if err != nil {
-		return false, err
+		return false, err // wraps ErrUnavailable with the D-Bus cause
 	}
 	dev := conn.Object(fprintService, devPath)
 

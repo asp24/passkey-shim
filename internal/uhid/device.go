@@ -17,7 +17,6 @@ import (
 
 // Kernel event kinds from linux/uhid.h.
 const (
-	uhidDestroy = 1
 	EventStart  = 2
 	EventStop   = 3
 	EventOpen   = 4
@@ -112,13 +111,6 @@ func (d *Device) Create(uniq string) error {
 	return nil
 }
 
-func (d *Device) Destroy() error {
-	ev := make([]byte, 4)
-	binary.LittleEndian.PutUint32(ev[0:], uhidDestroy)
-	_, err := d.f.Write(ev)
-	return err
-}
-
 // sendInput pushes one 64-byte report from device to host.
 func (d *Device) SendInput(report []byte) error {
 	if len(report) != ReportSize {
@@ -128,8 +120,10 @@ func (d *Device) SendInput(report []byte) error {
 	binary.LittleEndian.PutUint32(ev[0:], uhidInput2)
 	binary.LittleEndian.PutUint16(ev[4:], uint16(len(report)))
 	copy(ev[6:], report)
-	_, err := d.f.Write(ev)
-	return err
+	if _, err := d.f.Write(ev); err != nil {
+		return fmt.Errorf("UHID_INPUT2: %w", err)
+	}
+	return nil
 }
 
 type Event struct {

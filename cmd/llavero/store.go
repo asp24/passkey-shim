@@ -26,7 +26,7 @@ func (s vaultStore) AddCredential(rp ctap.RPEntity, user ctap.UserEntity) ([]byt
 		UserDisplay: user.DisplayName,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, err // the vault names the failed step
 	}
 	return cred.ID, priv, nil
 }

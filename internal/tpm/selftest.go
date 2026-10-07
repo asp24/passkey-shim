@@ -3,6 +3,7 @@ package tpm
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
 	"go.uber.org/zap"
 )
@@ -11,7 +12,7 @@ import (
 // unseal it, and confirm the bytes survive.
 func SelfTest(log *zap.Logger) error {
 	if err := Available(); err != nil {
-		return err
+		return err // already explains what to do about it
 	}
 	log.Info("TPM device is reachable")
 
@@ -23,13 +24,13 @@ func SelfTest(log *zap.Logger) error {
 
 	blob, err := sealer.Seal(secret)
 	if err != nil {
-		return err
+		return fmt.Errorf("sealing the test secret: %w", err)
 	}
 	log.Info("sealed a secret", zap.Int("secret_bytes", len(secret)), zap.Int("blob_bytes", len(blob)))
 
 	got, err := sealer.Unseal(blob)
 	if err != nil {
-		return err
+		return fmt.Errorf("unsealing the test secret: %w", err)
 	}
 	if !bytes.Equal(got, secret) {
 		return errors.New("unsealed bytes do not match what was sealed")
@@ -40,7 +41,7 @@ func SelfTest(log *zap.Logger) error {
 	// own entropy to the wrapping and something is very wrong.
 	blob2, err := sealer.Seal(secret)
 	if err != nil {
-		return err
+		return fmt.Errorf("re-sealing the test secret: %w", err)
 	}
 	if bytes.Equal(blob, blob2) {
 		return errors.New("two seals of the same secret produced identical blobs")

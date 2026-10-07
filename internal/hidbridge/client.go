@@ -91,7 +91,7 @@ func (c *Client) Close() error { return c.conn.Close() }
 func (c *Client) expect(want byte) error {
 	got, err := c.readControl()
 	if err != nil {
-		return err
+		return err // readControl names the failed step
 	}
 	if got != want {
 		return fmt.Errorf("unexpected reply %d, want %d", got, want)
