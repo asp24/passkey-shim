@@ -79,7 +79,7 @@ scoped to the active seat session rather than every process you run.
 Then:
 
 ```sh
-go build -o llavero . && install -m755 llavero ~/.local/bin/
+go build -o llavero ./cmd/llavero && install -m755 llavero ~/.local/bin/
 llavero -unlock tpm          # creates the vault, no passphrase needed
 systemctl --user enable --now llavero.service
 ```
@@ -262,7 +262,7 @@ wire structs rather than importing the daemon's, so an encoding mistake cannot
 cancel itself out across both sides.
 
 ```sh
-go build -o llavero . && go build -o ctaptest ./cmd/ctaptest
+go build -o llavero ./cmd/llavero && go build -o ctaptest ./cmd/ctaptest
 ./llavero -vault /tmp/test.pkv -auto-approve -passphrase-fd 0 <<< 'testpass123' &
 ./ctaptest /dev/hidrawN        # the daemon logs which node it became
 ```

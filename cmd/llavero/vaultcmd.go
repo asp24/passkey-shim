@@ -1,0 +1,260 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"llavero/internal/tpm"
+	"llavero/internal/vault"
+)
+
+// loadVault opens an existing vault or creates one, asking only for the
+// factors the vault's own mode requires.
+func loadVault(opts options) (*vault.Vault, error) {
+	_, statErr := os.Stat(opts.vaultPath)
+	isNew := errors.Is(statErr, os.ErrNotExist)
+
+	mode := vault.ModePassphrase
+	if isNew {
+		m, err := vault.ParseUnlockMode(opts.unlock)
+		if err != nil {
+			return nil, err
+		}
+		mode = m
+	} else {
+		m, err := vault.ReadMode(opts.vaultPath)
+		if err != nil {
+			return nil, err
+		}
+		mode = m
+	}
+
+	if mode.NeedsTPM() {
+		if err := tpm.Available(); err != nil {
+			return nil, err
+		}
+	}
+
+	var passphrase []byte
+	if mode.NeedsPassphrase() {
+		p, err := readPassphrase(opts.passFD, isNew, "")
+		if err != nil {
+			return nil, err
+		}
+		defer zero(p)
+		passphrase = p
+	}
+
+	if isNew {
+		v, err := vault.Create(opts.vaultPath, mode, passphrase, tpm.Sealer{})
+		if err != nil {
+			return nil, err
+		}
+		logf("created a new vault at %s (unlock: %s)", opts.vaultPath, mode)
+		return v, nil
+	}
+
+	v, err := vault.Open(opts.vaultPath, passphrase, tpm.Sealer{})
+	if err != nil {
+		return nil, err
+	}
+	logf("unlocked %s (unlock: %s, %d passkey(s))", opts.vaultPath, v.Mode(), v.Count())
+	return v, nil
+}
+
+func runRekey(opts options) error {
+	newMode, err := vault.ParseUnlockMode(opts.rekeyTo)
+	if err != nil {
+		return err
+	}
+	if newMode.NeedsTPM() {
+		if err := tpm.Available(); err != nil {
+			return err
+		}
+	}
+
+	v, err := loadVault(opts)
+	if err != nil {
+		return err
+	}
+	if v.Mode() == newMode {
+		logf("vault is already in %s mode, nothing to do", newMode)
+		return nil
+	}
+
+	// Back up before touching anything. A failed rekey must never be the
+	// reason someone loses their passkeys.
+	backup := fmt.Sprintf("%s.bak-%s", opts.vaultPath, time.Now().Format("20060102-150405"))
+	if err := copyFile(opts.vaultPath, backup); err != nil {
+		return fmt.Errorf("could not back up the vault, refusing to rekey: %w", err)
+	}
+	logf("backed up the existing vault to %s", backup)
+
+	var newPass []byte
+	if newMode.NeedsPassphrase() {
+		p, err := readPassphrase(opts.newPassFD, true, "new ")
+		if err != nil {
+			return err
+		}
+		defer zero(p)
+		newPass = p
+	}
+
+	if err := v.Rekey(newMode, newPass); err != nil {
+		return fmt.Errorf("rekey failed (your backup at %s is still good): %w", backup, err)
+	}
+	logf("rekeyed to %s, %d passkey(s) preserved", newMode, v.Count())
+
+	// Prove the new file actually opens before declaring success.
+	check, err := vault.Open(opts.vaultPath, newPass, tpm.Sealer{})
+	if err != nil {
+		return fmt.Errorf("the rekeyed vault does not reopen (restore from %s): %w", backup, err)
+	}
+	if check.Count() != v.Count() {
+		return fmt.Errorf("credential count changed during rekey (restore from %s)", backup)
+	}
+	logf("verified: the rekeyed vault reopens and still holds %d passkey(s)", check.Count())
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o600)
+}
+
+// runList prints what is in the vault. Useful on its own, and the only way to
+// find the id of something worth deleting.
+func runList(opts options) error {
+	v, err := loadVault(opts)
+	if err != nil {
+		return err
+	}
+	creds := v.List()
+	if len(creds) == 0 {
+		fmt.Println("\nThe vault is empty.")
+		return nil
+	}
+	fmt.Printf("\n%-28s  %-34s  %-16s  %5s  %s\n", "SITE", "ACCOUNT", "CREDENTIAL", "USES", "CREATED")
+	for _, c := range creds {
+		account := c.UserName
+		if account == "" {
+			account = c.UserDisplay
+		}
+		fmt.Printf("%-28s  %-34s  %-16x  %5d  %s\n",
+			truncate(c.RPID, 28), truncate(account, 34), c.ID[:8], c.SignCount,
+			c.CreatedAt.Local().Format("2006-01-02 15:04"))
+	}
+	fmt.Printf("\n%d passkey(s).\n", len(creds))
+	return nil
+}
+
+// runForget deletes credentials by site or by credential id prefix. It always
+// shows what it is about to remove and asks first: there is no undo, and a
+// deleted passkey may be the only way into an account.
+func runForget(opts options) error {
+	if serviceHasOpen(opts.vaultPath) {
+		return errors.New("the llavero service is running against this vault and holds its own\n" +
+			"       copy in memory, so its next write would resurrect anything deleted here.\n" +
+			"       Stop it first:  systemctl --user stop llavero.service")
+	}
+
+	v, err := loadVault(opts)
+	if err != nil {
+		return err
+	}
+
+	needle := strings.ToLower(opts.forget)
+	match := func(c vault.Credential) bool {
+		return strings.ToLower(c.RPID) == needle ||
+			strings.HasPrefix(strings.ToLower(fmt.Sprintf("%x", c.ID)), needle)
+	}
+
+	var doomed []vault.Credential
+	for _, c := range v.List() {
+		if match(c) {
+			doomed = append(doomed, c)
+		}
+	}
+	if len(doomed) == 0 {
+		return fmt.Errorf("nothing in the vault matches %q (try -list)", opts.forget)
+	}
+
+	fmt.Printf("\nAbout to delete %d passkey(s):\n\n", len(doomed))
+	for _, c := range doomed {
+		fmt.Printf("  %s  %s  %x  (used %d time(s))\n", c.RPID, c.UserName, c.ID[:8], c.SignCount)
+	}
+	// Echo the exact string back. Saying "type the site name" invites a near
+	// miss on values like ".dummy", where the leading dot is easy to drop.
+	fmt.Printf("\nThis cannot be undone. Type %q to confirm: ", opts.forget)
+
+	var typed string
+	fmt.Scanln(&typed)
+	if strings.ToLower(strings.TrimSpace(typed)) != needle {
+		return fmt.Errorf("confirmation did not match (wanted %q, got %q), nothing was deleted",
+			opts.forget, strings.TrimSpace(typed))
+	}
+
+	gone, err := v.Remove(match)
+	if err != nil {
+		return err
+	}
+	logf("deleted %d passkey(s), %d remaining", len(gone), v.Count())
+	return nil
+}
+
+// serviceHasOpen reports whether the running service is using this very vault.
+// Editing a different file while the daemon runs is harmless, so the guard is
+// scoped to the path rather than refusing whenever the service happens to be up.
+func serviceHasOpen(vaultPath string) bool {
+	out, err := exec.Command("systemctl", "--user", "is-active", "llavero.service").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "active" {
+		return false
+	}
+
+	// The unit passes no -vault, so the service is on the default path. If it
+	// ever gains one, prefer what the unit actually says.
+	servicePath := vault.DefaultPath()
+	if line, err := exec.Command("systemctl", "--user", "show", "-p", "ExecStart",
+		"--value", "llavero.service").Output(); err == nil {
+		fields := strings.Fields(string(line))
+		for i, f := range fields {
+			if f == "-vault" && i+1 < len(fields) {
+				servicePath = fields[i+1]
+			}
+		}
+	}
+	return sameFile(vaultPath, servicePath)
+}
+
+// sameFile compares paths after resolving symlinks, falling back to a cleaned
+// absolute comparison when a path does not exist yet.
+func sameFile(a, b string) bool {
+	resolve := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return real
+		}
+		return filepath.Clean(p)
+	}
+	return resolve(a) == resolve(b)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 1 {
+		return s[:n]
+	}
+	return s[:n-1] + "\u2026"
+}
