@@ -37,7 +37,7 @@ func readPassphrase(passFD int, confirm bool, adjective string) ([]byte, error) 
 		first, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Println()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reading passphrase: %w", err)
 		}
 		if len(first) < 8 {
 			zero(first)
@@ -47,7 +47,7 @@ func readPassphrase(passFD int, confirm bool, adjective string) ([]byte, error) 
 		second, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Println()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reading passphrase confirmation: %w", err)
 		}
 		defer zero(second)
 		if string(first) != string(second) {
@@ -62,7 +62,10 @@ func readPassphrase(passFD int, confirm bool, adjective string) ([]byte, error) 
 	fmt.Print("Vault passphrase: ")
 	pass, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
-	return pass, err
+	if err != nil {
+		return nil, fmt.Errorf("reading passphrase: %w", err)
+	}
+	return pass, nil
 }
 
 // readLine consumes exactly one line and not a byte more, so the rest of the

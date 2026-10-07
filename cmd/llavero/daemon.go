@@ -53,7 +53,7 @@ func (a *app) run() error {
 
 	v, err := a.loadVault()
 	if err != nil {
-		return err
+		return err // loadVault's errors already say what failed
 	}
 
 	var ap ctap.Approver
@@ -129,7 +129,7 @@ func (a *app) run() error {
 	// Only now does the device appear, so browsers never see a key that
 	// cannot answer yet.
 	if err := dev.Create(); err != nil {
-		return err
+		return fmt.Errorf("UHID service: %w", err)
 	}
 
 	// Closing the broker connection is what wakes dev.Read on shutdown.

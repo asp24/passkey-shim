@@ -26,20 +26,20 @@ func (a *app) loadVault() (*vault.Vault, error) {
 	if isNew {
 		m, err := vault.ParseUnlockMode(opts.unlock)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("-unlock: %w", err)
 		}
 		mode = m
 	} else {
 		m, err := vault.ReadMode(opts.vaultPath)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("checking the vault's unlock mode: %w", err)
 		}
 		mode = m
 	}
 
 	if mode.NeedsTPM() {
 		if err := tpm.Available(); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("this vault needs the TPM: %w", err)
 		}
 	}
 
@@ -47,7 +47,7 @@ func (a *app) loadVault() (*vault.Vault, error) {
 	if mode.NeedsPassphrase() {
 		p, err := readPassphrase(opts.passFD, isNew, "")
 		if err != nil {
-			return nil, err
+			return nil, err // readPassphrase's errors already say what failed
 		}
 		defer zero(p)
 		passphrase = p
@@ -56,7 +56,7 @@ func (a *app) loadVault() (*vault.Vault, error) {
 	if isNew {
 		v, err := vault.Create(opts.vaultPath, mode, passphrase, tpm.Sealer{})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("creating the vault: %w", err)
 		}
 		a.log.Info("created a new vault", zap.String("path", opts.vaultPath), zap.Stringer("unlock", mode))
 		return v, nil
@@ -64,7 +64,7 @@ func (a *app) loadVault() (*vault.Vault, error) {
 
 	v, err := vault.Open(opts.vaultPath, passphrase, tpm.Sealer{})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unlocking the vault: %w", err)
 	}
 	a.log.Info("unlocked the vault", zap.String("path", opts.vaultPath),
 		zap.Stringer("unlock", v.Mode()), zap.Int("passkeys", v.Count()))
@@ -75,17 +75,17 @@ func (a *app) runRekey() error {
 	opts := a.opts
 	newMode, err := vault.ParseUnlockMode(opts.rekeyTo)
 	if err != nil {
-		return err
+		return fmt.Errorf("-rekey: %w", err)
 	}
 	if newMode.NeedsTPM() {
 		if err := tpm.Available(); err != nil {
-			return err
+			return fmt.Errorf("%s needs the TPM: %w", newMode, err)
 		}
 	}
 
 	v, err := a.loadVault()
 	if err != nil {
-		return err
+		return err // loadVault's errors already say what failed
 	}
 	if v.Mode() == newMode {
 		a.log.Info("vault is already in this mode, nothing to do", zap.Stringer("unlock", newMode))
@@ -104,7 +104,7 @@ func (a *app) runRekey() error {
 	if newMode.NeedsPassphrase() {
 		p, err := readPassphrase(opts.newPassFD, true, "new ")
 		if err != nil {
-			return err
+			return err // readPassphrase's errors already say what failed
 		}
 		defer zero(p)
 		newPass = p
@@ -130,9 +130,12 @@ func (a *app) runRekey() error {
 func copyFile(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading %s: %w", src, err)
 	}
-	return os.WriteFile(dst, data, 0o600)
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		return fmt.Errorf("writing %s: %w", dst, err)
+	}
+	return nil
 }
 
 // runList prints what is in the vault. Useful on its own, and the only way to
@@ -140,7 +143,7 @@ func copyFile(src, dst string) error {
 func (a *app) runList() error {
 	v, err := a.loadVault()
 	if err != nil {
-		return err
+		return err // loadVault's errors already say what failed
 	}
 	creds := v.List()
 	if len(creds) == 0 {
@@ -174,7 +177,7 @@ func (a *app) runForget() error {
 
 	v, err := a.loadVault()
 	if err != nil {
-		return err
+		return err // loadVault's errors already say what failed
 	}
 
 	needle := strings.ToLower(opts.forget)
@@ -210,7 +213,7 @@ func (a *app) runForget() error {
 
 	gone, err := v.Remove(match)
 	if err != nil {
-		return err
+		return fmt.Errorf("deleting passkeys: %w", err)
 	}
 	a.log.Info("deleted passkeys", zap.Int("deleted", len(gone)), zap.Int("remaining", v.Count()))
 	return nil
