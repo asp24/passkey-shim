@@ -61,11 +61,12 @@ func (a *app) run() error {
 		a.log.Warn("-auto-approve is set: every request will be granted without asking")
 		ap = approval.Auto{}
 	} else {
-		ap, err = approval.NewMenu()
+		ap, err = approval.New(opts.approval)
 		if err != nil {
 			return fmt.Errorf("no approval UI available: %w\n"+
-				"       (omarchy-menu-select is required, or run with -auto-approve for testing)", err)
+				"       (install zenity or omarchy-menu-select, or run with -auto-approve for testing)", err)
 		}
+		a.log.Info("approval prompt", zap.String("backend", fmt.Sprintf("%T", ap)))
 	}
 
 	// Keep this an interface and assign it only on success: a nil

@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"llavero/internal/approval"
 	"llavero/internal/logging"
 	"llavero/internal/notify"
 	"llavero/internal/tpm"
@@ -47,6 +48,7 @@ type options struct {
 	forget      string
 	mlock       bool
 	autoApprove bool
+	approval    string
 	passFD      int
 	newPassFD   int
 }
@@ -67,6 +69,7 @@ func main() {
 	flag.BoolVar(&opts.mlock, "mlock", true, "lock memory so keys cannot be written to swap")
 	flag.BoolVar(&opts.list, "list", false, "list stored passkeys, then exit")
 	flag.StringVar(&opts.forget, "forget", "", "delete passkeys matching a site or a credential id prefix, then exit")
+	flag.StringVar(&opts.approval, "approval", approval.BackendAuto, "approval prompt: auto, omarchy or zenity")
 	flag.BoolVar(&opts.autoApprove, "auto-approve", false, "approve every request without prompting (testing only)")
 	flag.IntVar(&opts.passFD, "passphrase-fd", -1, "read the vault passphrase from this file descriptor")
 	flag.IntVar(&opts.newPassFD, "new-passphrase-fd", -1, "read the NEW passphrase for -rekey from this file descriptor")

@@ -17,9 +17,10 @@ dash.cloudflare.com   89fd29a150f3...  e2f02eed7cb9df6b      8  2026-09-17 20:54
 webauthn.io           alice            42e0a5c37ed7ef9e      7  2026-09-17 19:53
 ```
 
-Tested against Chrome and Firefox on Arch with Hyprland. It should work on any
-Linux with a TPM 2.0, `uhid`, and `fprintd`, though those are the only two
-browsers and the only desktop it has actually been run on.
+Tested against Chrome and Firefox on Arch with Hyprland (Omarchy); the approval
+dialog also runs on GNOME through zenity. It should work on any Linux with a
+TPM 2.0, `uhid`, `fprintd`, and either `omarchy-menu-select` or `zenity` for
+the approval prompt.
 
 ## Why this shape
 
@@ -152,6 +153,7 @@ llavero -vault /tmp/portable.pkv -list
 | `-vault PATH` | vault file location |
 | `-unlock MODE` | unlock mode for a **new** vault |
 | `-rekey MODE` | re-encrypt an existing vault, then exit |
+| `-approval auto\|omarchy\|zenity` | approval dialog: `auto` uses Omarchy's picker if installed, otherwise zenity (GNOME and other GTK desktops) |
 | `-uv fingerprint\|prompt` | user verification method |
 | `-uv-strict` | deny when the sensor is unusable, instead of falling back |
 | `-passphrase-fd N` | read the passphrase from a descriptor (`0` for stdin) |

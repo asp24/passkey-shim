@@ -2,8 +2,9 @@
 Description=Llavero (virtual FIDO2 authenticator)
 Documentation=file:%h/Work/llavero/README.md
 # Bound to the graphical session because approval prompts need Wayland.
-# uwsm exports WAYLAND_DISPLAY and HYPRLAND_INSTANCE_SIGNATURE into the user
-# manager, so omarchy-menu-select and notify-send work from here.
+# uwsm (Hyprland) and gnome-session export WAYLAND_DISPLAY into the user
+# manager, so the approval prompt (omarchy-menu-select or zenity) and desktop
+# notifications work from here.
 After=graphical-session.target
 PartOf=graphical-session.target
 # Do not restart forever if the vault simply cannot be unlocked.
