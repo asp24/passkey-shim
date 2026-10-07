@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"llavero/internal/vault"
 )
 
 type approver interface {
@@ -29,7 +31,7 @@ type userVerifier interface {
 }
 
 type authenticator struct {
-	vault    *vault
+	vault    *vault.Vault
 	approver approver
 	verifier userVerifier // nil when biometric UV is off
 	strictUV bool         // if set, a broken sensor denies instead of falling back
@@ -229,7 +231,7 @@ func (a *authenticator) makeCredential(body []byte) []byte {
 	// excludeList is how an RP says "this user already has a key here". The
 	// spec wants user presence before we admit it, but a desktop prompt for a
 	// duplicate registration is noise, so we answer directly.
-	if a.vault.hasCredentialFor(req.RP.ID, req.ExcludeList) {
+	if a.vault.HasCredentialFor(req.RP.ID, descriptorIDs(req.ExcludeList)) {
 		a.logf("makeCredential: %s already has a credential in the exclude list", req.RP.ID)
 		return []byte{statusCredentialExcluded}
 	}
@@ -247,7 +249,13 @@ func (a *authenticator) makeCredential(body []byte) []byte {
 		return []byte{statusOperationDenied}
 	}
 
-	cred, priv, err := a.vault.addCredential(req.RP, req.User)
+	cred, priv, err := a.vault.AddCredential(vault.Account{
+		RPID:        req.RP.ID,
+		RPName:      req.RP.Name,
+		UserID:      req.User.ID,
+		UserName:    req.User.Name,
+		UserDisplay: req.User.DisplayName,
+	})
 	if err != nil {
 		a.logf("makeCredential: vault write failed: %v", err)
 		return []byte{statusOther}
@@ -290,7 +298,7 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 		return []byte{statusInvalidParameter}
 	}
 
-	matches := a.vault.findForRP(req.RPID, req.AllowList)
+	matches := a.vault.FindForRP(req.RPID, descriptorIDs(req.AllowList))
 	if len(matches) == 0 {
 		a.logf("getAssertion: no credential for %s", req.RPID)
 		return []byte{statusNoCredentials}
@@ -337,13 +345,13 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 		}
 	}
 
-	priv, err := parsePrivateKey(chosen.PrivateKey)
+	priv, err := vault.ParsePrivateKey(chosen.PrivateKey)
 	if err != nil {
 		a.logf("getAssertion: stored key unusable: %v", err)
 		return []byte{statusOther}
 	}
 
-	count, err := a.vault.bumpSignCount(chosen.ID)
+	count, err := a.vault.BumpSignCount(chosen.ID)
 	if err != nil {
 		a.logf("getAssertion: could not persist sign count: %v", err)
 		return []byte{statusOther}
@@ -471,6 +479,15 @@ func isPrintable(s string) bool {
 		}
 	}
 	return true
+}
+
+// descriptorIDs extracts the credential IDs from an allow or exclude list.
+func descriptorIDs(list []credentialDescriptor) [][]byte {
+	ids := make([][]byte, 0, len(list))
+	for _, d := range list {
+		ids = append(ids, d.ID)
+	}
+	return ids
 }
 
 func indexOf(hay []string, needle string) int {

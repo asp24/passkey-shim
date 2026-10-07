@@ -27,6 +27,7 @@ import (
 	"llavero/internal/hidbridge"
 	"llavero/internal/notify"
 	"llavero/internal/tpm"
+	"llavero/internal/vault"
 )
 
 // aaguid identifies the authenticator model, not the user or the installation.
@@ -74,7 +75,7 @@ func main() {
 		tpmSelftest = flag.Bool("tpm-selftest", false, "seal and unseal a test secret, then exit")
 		verboseFlag = flag.Bool("v", false, "log every CTAPHID frame")
 	)
-	flag.StringVar(&opts.vaultPath, "vault", defaultVaultPath(), "path to the encrypted vault file")
+	flag.StringVar(&opts.vaultPath, "vault", vault.DefaultPath(), "path to the encrypted vault file")
 	flag.StringVar(&opts.unlock, "unlock", "passphrase", "unlock mode for a NEW vault: passphrase, tpm, or tpm+passphrase")
 	flag.StringVar(&opts.rekeyTo, "rekey", "", "re-encrypt an existing vault under this unlock mode, then exit")
 	flag.StringVar(&opts.uv, "uv", "fingerprint", "user verification: fingerprint or prompt")
@@ -106,33 +107,33 @@ func main() {
 
 // loadVault opens an existing vault or creates one, asking only for the
 // factors the vault's own mode requires.
-func loadVault(opts options) (*vault, error) {
+func loadVault(opts options) (*vault.Vault, error) {
 	_, statErr := os.Stat(opts.vaultPath)
 	isNew := errors.Is(statErr, os.ErrNotExist)
 
-	mode := modePassphrase
+	mode := vault.ModePassphrase
 	if isNew {
-		m, err := parseUnlockMode(opts.unlock)
+		m, err := vault.ParseUnlockMode(opts.unlock)
 		if err != nil {
 			return nil, err
 		}
 		mode = m
 	} else {
-		m, err := readVaultHeader(opts.vaultPath)
+		m, err := vault.ReadMode(opts.vaultPath)
 		if err != nil {
 			return nil, err
 		}
 		mode = m
 	}
 
-	if mode.needsTPM() {
+	if mode.NeedsTPM() {
 		if err := tpm.Available(); err != nil {
 			return nil, err
 		}
 	}
 
 	var passphrase []byte
-	if mode.needsPassphrase() {
+	if mode.NeedsPassphrase() {
 		p, err := readPassphrase(opts.passFD, isNew, "")
 		if err != nil {
 			return nil, err
@@ -142,7 +143,7 @@ func loadVault(opts options) (*vault, error) {
 	}
 
 	if isNew {
-		v, err := createVault(opts.vaultPath, mode, passphrase)
+		v, err := vault.Create(opts.vaultPath, mode, passphrase, tpm.Sealer{})
 		if err != nil {
 			return nil, err
 		}
@@ -150,20 +151,20 @@ func loadVault(opts options) (*vault, error) {
 		return v, nil
 	}
 
-	v, err := openVault(opts.vaultPath, passphrase)
+	v, err := vault.Open(opts.vaultPath, passphrase, tpm.Sealer{})
 	if err != nil {
 		return nil, err
 	}
-	logf("unlocked %s (unlock: %s, %d passkey(s))", opts.vaultPath, v.mode, v.count())
+	logf("unlocked %s (unlock: %s, %d passkey(s))", opts.vaultPath, v.Mode(), v.Count())
 	return v, nil
 }
 
 func runRekey(opts options) error {
-	newMode, err := parseUnlockMode(opts.rekeyTo)
+	newMode, err := vault.ParseUnlockMode(opts.rekeyTo)
 	if err != nil {
 		return err
 	}
-	if newMode.needsTPM() {
+	if newMode.NeedsTPM() {
 		if err := tpm.Available(); err != nil {
 			return err
 		}
@@ -173,7 +174,7 @@ func runRekey(opts options) error {
 	if err != nil {
 		return err
 	}
-	if v.mode == newMode {
+	if v.Mode() == newMode {
 		logf("vault is already in %s mode, nothing to do", newMode)
 		return nil
 	}
@@ -187,7 +188,7 @@ func runRekey(opts options) error {
 	logf("backed up the existing vault to %s", backup)
 
 	var newPass []byte
-	if newMode.needsPassphrase() {
+	if newMode.NeedsPassphrase() {
 		p, err := readPassphrase(opts.newPassFD, true, "new ")
 		if err != nil {
 			return err
@@ -196,20 +197,20 @@ func runRekey(opts options) error {
 		newPass = p
 	}
 
-	if err := v.rekey(newMode, newPass); err != nil {
+	if err := v.Rekey(newMode, newPass); err != nil {
 		return fmt.Errorf("rekey failed (your backup at %s is still good): %w", backup, err)
 	}
-	logf("rekeyed to %s, %d passkey(s) preserved", newMode, v.count())
+	logf("rekeyed to %s, %d passkey(s) preserved", newMode, v.Count())
 
 	// Prove the new file actually opens before declaring success.
-	check, err := openVault(opts.vaultPath, newPass)
+	check, err := vault.Open(opts.vaultPath, newPass, tpm.Sealer{})
 	if err != nil {
 		return fmt.Errorf("the rekeyed vault does not reopen (restore from %s): %w", backup, err)
 	}
-	if check.count() != v.count() {
+	if check.Count() != v.Count() {
 		return fmt.Errorf("credential count changed during rekey (restore from %s)", backup)
 	}
-	logf("verified: the rekeyed vault reopens and still holds %d passkey(s)", check.count())
+	logf("verified: the rekeyed vault reopens and still holds %d passkey(s)", check.Count())
 	return nil
 }
 
@@ -471,7 +472,7 @@ func runList(opts options) error {
 	if err != nil {
 		return err
 	}
-	creds := v.list()
+	creds := v.List()
 	if len(creds) == 0 {
 		fmt.Println("\nThe vault is empty.")
 		return nil
@@ -506,13 +507,13 @@ func runForget(opts options) error {
 	}
 
 	needle := strings.ToLower(opts.forget)
-	match := func(c storedCredential) bool {
+	match := func(c vault.Credential) bool {
 		return strings.ToLower(c.RPID) == needle ||
 			strings.HasPrefix(strings.ToLower(fmt.Sprintf("%x", c.ID)), needle)
 	}
 
-	var doomed []storedCredential
-	for _, c := range v.list() {
+	var doomed []vault.Credential
+	for _, c := range v.List() {
 		if match(c) {
 			doomed = append(doomed, c)
 		}
@@ -536,11 +537,11 @@ func runForget(opts options) error {
 			opts.forget, strings.TrimSpace(typed))
 	}
 
-	gone, err := v.remove(match)
+	gone, err := v.Remove(match)
 	if err != nil {
 		return err
 	}
-	logf("deleted %d passkey(s), %d remaining", len(gone), v.count())
+	logf("deleted %d passkey(s), %d remaining", len(gone), v.Count())
 	return nil
 }
 
@@ -555,7 +556,7 @@ func serviceHasOpen(vaultPath string) bool {
 
 	// The unit passes no -vault, so the service is on the default path. If it
 	// ever gains one, prefer what the unit actually says.
-	servicePath := defaultVaultPath()
+	servicePath := vault.DefaultPath()
 	if line, err := exec.Command("systemctl", "--user", "show", "-p", "ExecStart",
 		"--value", "llavero.service").Output(); err == nil {
 		fields := strings.Fields(string(line))

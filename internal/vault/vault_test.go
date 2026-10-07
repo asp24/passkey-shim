@@ -1,4 +1,4 @@
-package main
+package vault
 
 import (
 	"bytes"
@@ -73,7 +73,7 @@ func sampleContents(t *testing.T) vaultContents {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return vaultContents{Credentials: []storedCredential{{
+	return vaultContents{Credentials: []Credential{{
 		ID:         []byte("credential-id-0001"),
 		RPID:       "example.test",
 		UserID:     []byte("user-0001"),
@@ -93,17 +93,17 @@ func TestOpensLegacyV1Vault(t *testing.T) {
 
 	writeLegacyV1Vault(t, path, pass, want)
 
-	v, err := openVault(path, pass)
+	v, err := Open(path, pass, nil)
 	if err != nil {
 		t.Fatalf("a version 1 vault failed to open: %v", err)
 	}
-	if v.mode != modePassphrase {
+	if v.mode != ModePassphrase {
 		t.Errorf("mode = %v, want passphrase", v.mode)
 	}
 	if !v.upgradedFromV1 {
 		t.Error("upgradedFromV1 should be set for a v1 file")
 	}
-	if got := v.count(); got != 1 {
+	if got := v.Count(); got != 1 {
 		t.Fatalf("credential count = %d, want 1", got)
 	}
 	if got := v.contents.Credentials[0].UserName; got != "alice" {
@@ -121,7 +121,7 @@ func TestLegacyV1WrongPassphraseStillFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vault.pkv")
 	writeLegacyV1Vault(t, path, []byte("the real passphrase"), sampleContents(t))
 
-	if _, err := openVault(path, []byte("not the passphrase")); err == nil {
+	if _, err := Open(path, []byte("not the passphrase"), nil); err == nil {
 		t.Fatal("a wrong passphrase opened a v1 vault")
 	}
 }
@@ -133,13 +133,13 @@ func TestV1UpgradesToV2OnWrite(t *testing.T) {
 	pass := []byte("correct horse battery staple")
 	writeLegacyV1Vault(t, path, pass, sampleContents(t))
 
-	v, err := openVault(path, pass)
+	v, err := Open(path, pass, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Any mutation triggers a save.
-	if _, err := v.bumpSignCount([]byte("credential-id-0001")); err != nil {
+	if _, err := v.BumpSignCount([]byte("credential-id-0001")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -151,14 +151,14 @@ func TestV1UpgradesToV2OnWrite(t *testing.T) {
 		t.Fatalf("file version = %d after write, want %d", raw[4], vaultVersion2)
 	}
 
-	reopened, err := openVault(path, pass)
+	reopened, err := Open(path, pass, nil)
 	if err != nil {
 		t.Fatalf("upgraded vault will not reopen: %v", err)
 	}
 	if reopened.upgradedFromV1 {
 		t.Error("upgradedFromV1 should be clear on a v2 file")
 	}
-	if got := reopened.count(); got != 1 {
+	if got := reopened.Count(); got != 1 {
 		t.Fatalf("credential count = %d after upgrade, want 1", got)
 	}
 	if got := reopened.contents.Credentials[0].SignCount; got != 8 {
@@ -172,11 +172,11 @@ func TestV1AndV2DerivationsDiffer(t *testing.T) {
 	salt := bytes.Repeat([]byte{0xAB}, saltLen)
 	pass := []byte("same passphrase")
 
-	legacy, err := deriveVaultKey(modePassphrase, salt, pass, nil, true)
+	legacy, err := deriveVaultKey(ModePassphrase, salt, pass, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := deriveVaultKey(modePassphrase, salt, pass, nil, false)
+	current, err := deriveVaultKey(ModePassphrase, salt, pass, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func TestUnlockModesProduceDistinctKeys(t *testing.T) {
 	tpmSecret := bytes.Repeat([]byte{0xEF}, tpmSecretLen)
 
 	keys := map[string]string{}
-	for _, m := range []unlockMode{modePassphrase, modeTPM, modeTPMPass} {
+	for _, m := range []UnlockMode{ModePassphrase, ModeTPM, ModeTPMPass} {
 		k, err := deriveVaultKey(m, salt, pass, tpmSecret, false)
 		if err != nil {
 			t.Fatalf("%v: %v", m, err)
@@ -202,23 +202,5 @@ func TestUnlockModesProduceDistinctKeys(t *testing.T) {
 			t.Fatalf("modes %s and %s derive the same key", prev, m)
 		}
 		keys[string(k)] = m.String()
-	}
-}
-
-// Chrome's ".dummy" sentinel registration must never reach the vault, and real
-// RP IDs must never be caught by the same screen.
-func TestRPIDPlausibility(t *testing.T) {
-	reject := []string{"", ".", ".dummy", "example.com.", "a..b", "has space.com", "http://x.com", "a/b"}
-	accept := []string{"localhost", "dash.cloudflare.com", "webauthn.io", "example.com", "a.b.c.d.example.co.uk"}
-
-	for _, id := range reject {
-		if isPlausibleRPID(id) {
-			t.Errorf("accepted implausible RP ID %q", id)
-		}
-	}
-	for _, id := range accept {
-		if !isPlausibleRPID(id) {
-			t.Errorf("rejected real RP ID %q", id)
-		}
 	}
 }

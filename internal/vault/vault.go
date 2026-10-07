@@ -1,6 +1,4 @@
-package main
-
-// Encrypted credential store.
+// Package vault is the encrypted credential store.
 //
 // On-disk layout, version 2:
 //
@@ -10,6 +8,7 @@ package main
 // neither the salt nor the unlock mode can be altered to force a weaker
 // derivation. Version 1 files (no mode byte, passphrase only) still open, so
 // existing vaults keep working.
+package vault
 
 import (
 	"crypto/aes"
@@ -28,8 +27,6 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
-
-	"llavero/internal/tpm"
 )
 
 const (
@@ -45,47 +42,60 @@ const (
 	tpmSecretLen    = 32
 )
 
-// unlockMode records which factors are needed to derive the vault key.
-type unlockMode byte
+// UnlockMode records which factors are needed to derive the vault key.
+type UnlockMode byte
 
+// Unlock modes. The values are stored in the vault header.
 const (
-	modePassphrase unlockMode = 0 // passphrase only
-	modeTPM        unlockMode = 1 // TPM-sealed secret only, so no typing at boot
-	modeTPMPass    unlockMode = 2 // both
+	ModePassphrase UnlockMode = 0 // passphrase only
+	ModeTPM        UnlockMode = 1 // TPM-sealed secret only, so no typing at boot
+	ModeTPMPass    UnlockMode = 2 // both
 )
 
-func (m unlockMode) String() string {
+func (m UnlockMode) String() string {
 	switch m {
-	case modePassphrase:
+	case ModePassphrase:
 		return "passphrase"
-	case modeTPM:
+	case ModeTPM:
 		return "tpm"
-	case modeTPMPass:
+	case ModeTPMPass:
 		return "tpm+passphrase"
 	default:
 		return fmt.Sprintf("unknown(%d)", byte(m))
 	}
 }
 
-func parseUnlockMode(s string) (unlockMode, error) {
+// ParseUnlockMode parses a mode as String prints it.
+func ParseUnlockMode(s string) (UnlockMode, error) {
 	switch s {
 	case "passphrase":
-		return modePassphrase, nil
+		return ModePassphrase, nil
 	case "tpm":
-		return modeTPM, nil
+		return ModeTPM, nil
 	case "tpm+passphrase":
-		return modeTPMPass, nil
+		return ModeTPMPass, nil
 	default:
 		return 0, fmt.Errorf("unknown unlock mode %q (want passphrase, tpm, or tpm+passphrase)", s)
 	}
 }
 
-func (m unlockMode) needsPassphrase() bool { return m == modePassphrase || m == modeTPMPass }
-func (m unlockMode) needsTPM() bool        { return m == modeTPM || m == modeTPMPass }
+// NeedsPassphrase reports whether the mode asks the user for a passphrase.
+func (m UnlockMode) NeedsPassphrase() bool { return m == ModePassphrase || m == ModeTPMPass }
 
-var errBadPassphrase = errors.New("wrong passphrase, or vault file is corrupt")
+// NeedsTPM reports whether the mode mixes in a TPM-sealed secret.
+func (m UnlockMode) NeedsTPM() bool { return m == ModeTPM || m == ModeTPMPass }
 
-type storedCredential struct {
+// ErrBadPassphrase is returned when a vault does not decrypt.
+var ErrBadPassphrase = errors.New("wrong passphrase, or vault file is corrupt")
+
+// Sealer binds a secret to this machine, as a TPM does.
+type Sealer interface {
+	Seal(secret []byte) ([]byte, error)
+	Unseal(blob []byte) ([]byte, error)
+}
+
+// Credential is one stored passkey. The JSON tags are the on-disk format.
+type Credential struct {
 	ID          []byte    `json:"id"`
 	RPID        string    `json:"rp_id"`
 	RPName      string    `json:"rp_name,omitempty"`
@@ -98,22 +108,25 @@ type storedCredential struct {
 }
 
 type vaultContents struct {
-	Credentials []storedCredential `json:"credentials"`
+	Credentials []Credential `json:"credentials"`
 }
 
-type vault struct {
-	mu   sync.Mutex
-	path string
-	key  []byte
-	salt []byte
-	mode unlockMode
+// Vault is an unlocked vault. All methods are safe for concurrent use.
+type Vault struct {
+	mu     sync.Mutex
+	path   string
+	sealer Sealer
+	key    []byte
+	salt   []byte
+	mode   UnlockMode
 	// upgradedFromV1 means the file on disk is still the old format and will
 	// be rewritten as v2 on the next save.
 	upgradedFromV1 bool
 	contents       vaultContents
 }
 
-func defaultVaultPath() string {
+// DefaultPath is $XDG_DATA_HOME/llavero/vault.pkv.
+func DefaultPath() string {
 	dir := os.Getenv("XDG_DATA_HOME")
 	if dir == "" {
 		home, _ := os.UserHomeDir()
@@ -133,9 +146,9 @@ func tpmBlobPath(vaultPath string) string { return vaultPath + ".tpm" }
 // directly as the AES key with no HKDF step. Version 1 vaults were written
 // that way and must keep opening, so this is not optional and not removable
 // while any v1 file might still exist.
-func deriveVaultKey(mode unlockMode, salt, passphrase, tpmSecret []byte, legacyV1 bool) ([]byte, error) {
+func deriveVaultKey(mode UnlockMode, salt, passphrase, tpmSecret []byte, legacyV1 bool) ([]byte, error) {
 	if legacyV1 {
-		if mode != modePassphrase {
+		if mode != ModePassphrase {
 			return nil, errors.New("version 1 vaults are passphrase-only")
 		}
 		return pbkdf2.Key(sha256.New, string(passphrase), salt, kdfIterations, 32)
@@ -143,14 +156,14 @@ func deriveVaultKey(mode unlockMode, salt, passphrase, tpmSecret []byte, legacyV
 
 	var ikm []byte
 
-	if mode.needsPassphrase() {
+	if mode.NeedsPassphrase() {
 		stretched, err := pbkdf2.Key(sha256.New, string(passphrase), salt, kdfIterations, 32)
 		if err != nil {
 			return nil, err
 		}
 		ikm = append(ikm, stretched...)
 	}
-	if mode.needsTPM() {
+	if mode.NeedsTPM() {
 		if len(tpmSecret) != tpmSecretLen {
 			return nil, errors.New("TPM secret missing or wrong size")
 		}
@@ -171,9 +184,9 @@ func deriveVaultKey(mode unlockMode, salt, passphrase, tpmSecret []byte, legacyV
 	return hkdf.Key(sha256.New, ikm, salt, info, 32)
 }
 
-// readVaultHeader reports the mode a vault file was written in, without
+// ReadMode reports the mode a vault file was written in, without
 // needing any credentials. Callers use it to know what to ask the user for.
-func readVaultHeader(path string) (unlockMode, error) {
+func ReadMode(path string) (UnlockMode, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
@@ -183,19 +196,20 @@ func readVaultHeader(path string) (unlockMode, error) {
 	}
 	switch raw[4] {
 	case vaultVersion1:
-		return modePassphrase, nil
+		return ModePassphrase, nil
 	case vaultVersion2:
 		if len(raw) < headerLenV2 {
 			return 0, errors.New("vault file is truncated")
 		}
-		return unlockMode(raw[5]), nil
+		return UnlockMode(raw[5]), nil
 	default:
 		return 0, fmt.Errorf("unsupported vault version %d", raw[4])
 	}
 }
 
-// openVault decrypts an existing vault. It does not create one; use createVault.
-func openVault(path string, passphrase []byte) (*vault, error) {
+// Open decrypts an existing vault. It does not create one; use Create. sealer
+// may be nil for a vault that does not use the TPM.
+func Open(path string, passphrase []byte, sealer Sealer) (*Vault, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -205,18 +219,18 @@ func openVault(path string, passphrase []byte) (*vault, error) {
 	}
 
 	var (
-		mode      unlockMode
+		mode      UnlockMode
 		headerLen int
 		legacyV1  bool
 	)
 	switch raw[4] {
 	case vaultVersion1:
-		mode, headerLen, legacyV1 = modePassphrase, headerLenV1, true
+		mode, headerLen, legacyV1 = ModePassphrase, headerLenV1, true
 	case vaultVersion2:
 		if len(raw) < headerLenV2 {
 			return nil, errors.New("vault file is truncated")
 		}
-		mode, headerLen = unlockMode(raw[5]), headerLenV2
+		mode, headerLen = UnlockMode(raw[5]), headerLenV2
 	default:
 		return nil, fmt.Errorf("unsupported vault version %d", raw[4])
 	}
@@ -227,12 +241,15 @@ func openVault(path string, passphrase []byte) (*vault, error) {
 	ciphertext := raw[headerLen:]
 
 	var tpmSecret []byte
-	if mode.needsTPM() {
+	if mode.NeedsTPM() {
+		if sealer == nil {
+			return nil, errors.New("this vault is TPM-bound but no TPM is configured")
+		}
 		blob, err := os.ReadFile(tpmBlobPath(path))
 		if err != nil {
 			return nil, fmt.Errorf("this vault is TPM-bound but its sealed blob is unreadable: %w", err)
 		}
-		tpmSecret, err = tpm.Sealer{}.Unseal(blob)
+		tpmSecret, err = sealer.Unseal(blob)
 		if err != nil {
 			return nil, err
 		}
@@ -244,10 +261,10 @@ func openVault(path string, passphrase []byte) (*vault, error) {
 	}
 	plain, err := decrypt(key, nonce, raw[:headerLen], ciphertext)
 	if err != nil {
-		if mode.needsTPM() && !mode.needsPassphrase() {
+		if mode.NeedsTPM() && !mode.NeedsPassphrase() {
 			return nil, errors.New("vault will not decrypt; the sealed blob and the vault file may be from different installs")
 		}
-		return nil, errBadPassphrase
+		return nil, ErrBadPassphrase
 	}
 
 	// The file opened under the old derivation. Switch the in-memory key to
@@ -262,28 +279,31 @@ func openVault(path string, passphrase []byte) (*vault, error) {
 		key = upgraded
 	}
 
-	v := &vault{path: path, key: key, salt: salt, mode: mode, upgradedFromV1: legacyV1}
+	v := &Vault{path: path, sealer: sealer, key: key, salt: salt, mode: mode, upgradedFromV1: legacyV1}
 	if err := json.Unmarshal(plain, &v.contents); err != nil {
 		return nil, fmt.Errorf("vault contents are malformed: %w", err)
 	}
 	return v, nil
 }
 
-// createVault writes a brand new empty vault in the requested mode, sealing a
-// fresh TPM secret if the mode needs one.
-func createVault(path string, mode unlockMode, passphrase []byte) (*vault, error) {
+// Create writes a brand new empty vault in the requested mode, sealing a
+// fresh TPM secret with sealer if the mode needs one.
+func Create(path string, mode UnlockMode, passphrase []byte, sealer Sealer) (*Vault, error) {
 	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, err
 	}
 
 	var tpmSecret []byte
-	if mode.needsTPM() {
+	if mode.NeedsTPM() {
+		if sealer == nil {
+			return nil, errors.New("this unlock mode needs a TPM but none is configured")
+		}
 		tpmSecret = make([]byte, tpmSecretLen)
 		if _, err := rand.Read(tpmSecret); err != nil {
 			return nil, err
 		}
-		blob, err := tpm.Sealer{}.Seal(tpmSecret)
+		blob, err := sealer.Seal(tpmSecret)
 		if err != nil {
 			return nil, err
 		}
@@ -299,16 +319,16 @@ func createVault(path string, mode unlockMode, passphrase []byte) (*vault, error
 	if err != nil {
 		return nil, err
 	}
-	v := &vault{path: path, key: key, salt: salt, mode: mode}
+	v := &Vault{path: path, sealer: sealer, key: key, salt: salt, mode: mode}
 	if err := v.save(); err != nil {
 		return nil, err
 	}
 	return v, nil
 }
 
-// rekey rewrites an already-open vault under a new mode, preserving every
+// Rekey rewrites an already-open vault under a new mode, preserving every
 // credential. The caller is responsible for having backed up the old file.
-func (v *vault) rekey(mode unlockMode, passphrase []byte) error {
+func (v *Vault) Rekey(mode UnlockMode, passphrase []byte) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -318,12 +338,15 @@ func (v *vault) rekey(mode unlockMode, passphrase []byte) error {
 	}
 
 	var tpmSecret []byte
-	if mode.needsTPM() {
+	if mode.NeedsTPM() {
+		if v.sealer == nil {
+			return errors.New("this unlock mode needs a TPM but none is configured")
+		}
 		tpmSecret = make([]byte, tpmSecretLen)
 		if _, err := rand.Read(tpmSecret); err != nil {
 			return err
 		}
-		blob, err := tpm.Sealer{}.Seal(tpmSecret)
+		blob, err := v.sealer.Seal(tpmSecret)
 		if err != nil {
 			return err
 		}
@@ -354,7 +377,7 @@ func decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
 
 // save rewrites the whole vault. Callers must hold v.mu, except on the
 // creation path where no other goroutine can see v yet.
-func (v *vault) save() error {
+func (v *Vault) save() error {
 	plain, err := json.Marshal(v.contents)
 	if err != nil {
 		return err
@@ -412,8 +435,24 @@ func (v *vault) save() error {
 	return os.Rename(tmp.Name(), v.path)
 }
 
-// addCredential mints a keypair for a new registration and persists it.
-func (v *vault) addCredential(rp rpEntity, user userEntity) (*storedCredential, *ecdsa.PrivateKey, error) {
+// Account names the relying party and user a new credential is minted for.
+type Account struct {
+	RPID        string
+	RPName      string
+	UserID      []byte
+	UserName    string
+	UserDisplay string
+}
+
+// Mode reports how the vault is unlocked.
+func (v *Vault) Mode() UnlockMode {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.mode
+}
+
+// AddCredential mints a keypair for a new registration and persists it.
+func (v *Vault) AddCredential(acct Account) (*Credential, *ecdsa.PrivateKey, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -430,13 +469,13 @@ func (v *vault) addCredential(rp rpEntity, user userEntity) (*storedCredential, 
 		return nil, nil, err
 	}
 
-	cred := storedCredential{
+	cred := Credential{
 		ID:          id,
-		RPID:        rp.ID,
-		RPName:      rp.Name,
-		UserID:      user.ID,
-		UserName:    user.Name,
-		UserDisplay: user.DisplayName,
+		RPID:        acct.RPID,
+		RPName:      acct.RPName,
+		UserID:      acct.UserID,
+		UserName:    acct.UserName,
+		UserDisplay: acct.UserDisplay,
 		PrivateKey:  pkcs8,
 		SignCount:   0,
 		CreatedAt:   time.Now().UTC(),
@@ -448,7 +487,7 @@ func (v *vault) addCredential(rp rpEntity, user userEntity) (*storedCredential, 
 	replaced := false
 	for i := range v.contents.Credentials {
 		c := &v.contents.Credentials[i]
-		if c.RPID == rp.ID && string(c.UserID) == string(user.ID) {
+		if c.RPID == acct.RPID && string(c.UserID) == string(acct.UserID) {
 			v.contents.Credentials[i] = cred
 			replaced = true
 			break
@@ -464,12 +503,13 @@ func (v *vault) addCredential(rp rpEntity, user userEntity) (*storedCredential, 
 	return &cred, priv, nil
 }
 
-// findForRP returns every credential registered to an RP, newest first.
-func (v *vault) findForRP(rpID string, allow []credentialDescriptor) []storedCredential {
+// FindForRP returns every credential registered to an RP, newest first. A
+// non-empty allow list restricts the result to those credential IDs.
+func (v *Vault) FindForRP(rpID string, allow [][]byte) []Credential {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	var out []storedCredential
+	var out []Credential
 	for _, c := range v.contents.Credentials {
 		if c.RPID != rpID {
 			continue
@@ -485,16 +525,18 @@ func (v *vault) findForRP(rpID string, allow []credentialDescriptor) []storedCre
 	return out
 }
 
-func matchesAllowList(id []byte, allow []credentialDescriptor) bool {
-	for _, d := range allow {
-		if string(d.ID) == string(id) {
+func matchesAllowList(id []byte, allow [][]byte) bool {
+	for _, a := range allow {
+		if string(a) == string(id) {
 			return true
 		}
 	}
 	return false
 }
 
-func (v *vault) hasCredentialFor(rpID string, exclude []credentialDescriptor) bool {
+// HasCredentialFor reports whether any of the excluded credential IDs is
+// registered to rpID.
+func (v *Vault) HasCredentialFor(rpID string, exclude [][]byte) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	for _, c := range v.contents.Credentials {
@@ -505,8 +547,8 @@ func (v *vault) hasCredentialFor(rpID string, exclude []credentialDescriptor) bo
 	return false
 }
 
-// bumpSignCount increments and persists the per-credential counter.
-func (v *vault) bumpSignCount(id []byte) (uint32, error) {
+// BumpSignCount increments and persists the per-credential counter.
+func (v *Vault) BumpSignCount(id []byte) (uint32, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	for i := range v.contents.Credentials {
@@ -519,22 +561,22 @@ func (v *vault) bumpSignCount(id []byte) (uint32, error) {
 	return 0, errors.New("credential not found")
 }
 
-// list returns a copy of every stored credential, oldest first.
-func (v *vault) list() []storedCredential {
+// List returns a copy of every stored credential, oldest first.
+func (v *Vault) List() []Credential {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	out := make([]storedCredential, len(v.contents.Credentials))
+	out := make([]Credential, len(v.contents.Credentials))
 	copy(out, v.contents.Credentials)
 	return out
 }
 
-// remove deletes every credential matching pred and persists the result.
+// Remove deletes every credential matching pred and persists the result.
 // It returns what was removed so the caller can report it.
-func (v *vault) remove(pred func(storedCredential) bool) ([]storedCredential, error) {
+func (v *Vault) Remove(pred func(Credential) bool) ([]Credential, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	var kept, gone []storedCredential
+	var kept, gone []Credential
 	for _, c := range v.contents.Credentials {
 		if pred(c) {
 			gone = append(gone, c)
@@ -552,13 +594,15 @@ func (v *vault) remove(pred func(storedCredential) bool) ([]storedCredential, er
 	return gone, nil
 }
 
-func (v *vault) count() int {
+// Count returns the number of stored credentials.
+func (v *Vault) Count() int {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return len(v.contents.Credentials)
 }
 
-func parsePrivateKey(pkcs8 []byte) (*ecdsa.PrivateKey, error) {
+// ParsePrivateKey decodes a stored PKCS#8 ECDSA key.
+func ParsePrivateKey(pkcs8 []byte) (*ecdsa.PrivateKey, error) {
 	k, err := x509.ParsePKCS8PrivateKey(pkcs8)
 	if err != nil {
 		return nil, err
