@@ -1,11 +1,11 @@
-package main
-
-// CTAPHID transport framing, per CTAP 2.1 section 11.2.
+// Package ctaphid implements CTAPHID transport framing, per CTAP 2.1 section
+// 11.2.
 //
 // Everything travels in 64-byte packets. A message opens with an "init" packet
 // carrying the command and total payload length, and spills into "continuation"
 // packets numbered 0,1,2... The sequence numbers are the only thing keeping
 // reassembly honest, so they are checked strictly.
+package ctaphid
 
 import (
 	"encoding/binary"
@@ -56,21 +56,26 @@ type assembly struct {
 	nextSeq byte
 }
 
-// reportSender delivers one 64-byte input report to the host.
-type reportSender interface {
+// ReportSender delivers one 64-byte input report to the host.
+type ReportSender interface {
 	SendInput(report []byte) error
 }
 
-type ctapHID struct {
-	dev     reportSender
+// Transport reassembles host packets into CTAPHID messages, answers the
+// transport-level commands itself and hands CTAP2 payloads to a handler.
+// HandlePacket must be called from one goroutine.
+type Transport struct {
+	dev     ReportSender
 	pending map[uint32]*assembly
 	nextCID uint32
 	onCBOR  func(payload []byte) []byte
 	logf    func(format string, args ...any)
 }
 
-func newCtapHID(dev reportSender, onCBOR func([]byte) []byte, logf func(string, ...any)) *ctapHID {
-	return &ctapHID{
+// New returns a Transport that answers through dev and passes each CTAP2
+// message to onCBOR, whose return value is sent back as the response.
+func New(dev ReportSender, onCBOR func([]byte) []byte, logf func(string, ...any)) *Transport {
+	return &Transport{
 		dev:     dev,
 		pending: make(map[uint32]*assembly),
 		nextCID: rand.Uint32() | 1,
@@ -79,8 +84,8 @@ func newCtapHID(dev reportSender, onCBOR func([]byte) []byte, logf func(string, 
 	}
 }
 
-// handlePacket consumes one 64-byte host-to-device packet.
-func (c *ctapHID) handlePacket(p []byte) {
+// HandlePacket consumes one 64-byte host-to-device packet.
+func (c *Transport) HandlePacket(p []byte) {
 	if len(p) < 5 {
 		c.logf("runt packet (%d bytes), ignoring", len(p))
 		return
@@ -152,7 +157,7 @@ func (c *ctapHID) handlePacket(p []byte) {
 	}
 }
 
-func (c *ctapHID) handleInit(cid uint32, nonce []byte) {
+func (c *Transport) handleInit(cid uint32, nonce []byte) {
 	newCID := cid
 	if cid == broadcastCID {
 		c.nextCID++
@@ -174,7 +179,7 @@ func (c *ctapHID) handleInit(cid uint32, nonce []byte) {
 	c.sendMessage(cid, cmdInit, resp)
 }
 
-func (c *ctapHID) dispatch(cid uint32, a *assembly) {
+func (c *Transport) dispatch(cid uint32, a *assembly) {
 	switch a.cmd {
 	case cmdPing:
 		c.logf("CTAPHID_PING on %08x (%d bytes), echoing", cid, len(a.payload))
@@ -206,7 +211,7 @@ func (c *ctapHID) dispatch(cid uint32, a *assembly) {
 //
 // Note this blocks the read loop, so CTAPHID_CANCEL is not honoured mid-prompt;
 // the host times out instead. Acceptable while there is one dialog at a time.
-func (c *ctapHID) runWithKeepalive(cid uint32, payload []byte) {
+func (c *Transport) runWithKeepalive(cid uint32, payload []byte) {
 	done := make(chan []byte, 1)
 	go func() { done <- c.onCBOR(payload) }()
 
@@ -223,7 +228,7 @@ func (c *ctapHID) runWithKeepalive(cid uint32, payload []byte) {
 	}
 }
 
-func (c *ctapHID) sendKeepalive(cid uint32, status byte) {
+func (c *Transport) sendKeepalive(cid uint32, status byte) {
 	pkt := make([]byte, packetSize)
 	binary.BigEndian.PutUint32(pkt[0:4], cid)
 	pkt[4] = cmdKeepalive | 0x80
@@ -234,13 +239,13 @@ func (c *ctapHID) sendKeepalive(cid uint32, status byte) {
 	}
 }
 
-func (c *ctapHID) sendError(cid uint32, code byte) {
+func (c *Transport) sendError(cid uint32, code byte) {
 	c.sendMessage(cid, cmdError, []byte{code})
 }
 
 // sendMessage fragments a payload back to the host across as many packets as
 // it takes.
-func (c *ctapHID) sendMessage(cid uint32, cmd byte, payload []byte) {
+func (c *Transport) sendMessage(cid uint32, cmd byte, payload []byte) {
 	pkt := make([]byte, packetSize)
 	binary.BigEndian.PutUint32(pkt[0:4], cid)
 	pkt[4] = cmd | 0x80

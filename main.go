@@ -23,6 +23,7 @@ import (
 
 	"llavero/internal/approval"
 	"llavero/internal/ctap"
+	"llavero/internal/ctaphid"
 	"llavero/internal/fingerprint"
 	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
@@ -326,7 +327,7 @@ func run(opts options) error {
 
 	go reportNode()
 
-	stack := newCtapHID(dev, auth.Handle, vlogf)
+	stack := ctaphid.New(dev, auth.Handle, vlogf)
 
 	for {
 		ev, err := dev.Read()
@@ -343,7 +344,7 @@ func run(opts options) error {
 		case hidbridge.EventStop:
 			vlogf("UHID_STOP")
 		case hidbridge.EventOutput:
-			stack.handlePacket(ev.Data)
+			stack.HandlePacket(ev.Data)
 		default:
 			vlogf("uhid event type %d", ev.Kind)
 		}
