@@ -22,6 +22,7 @@ import (
 	"golang.org/x/term"
 
 	"llavero/internal/approval"
+	"llavero/internal/fingerprint"
 	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
 	"llavero/internal/notify"
@@ -251,18 +252,21 @@ func run(opts options) error {
 		}
 	}
 
-	var verifier *fingerprintVerifier
+	// Keep this an interface and assign it only on success: a nil
+	// *fingerprint.Verifier stored here would compare non-nil.
+	var verifier userVerifier
 	switch opts.uv {
 	case "fingerprint":
 		if opts.autoApprove {
 			break // testing mode skips biometrics too
 		}
-		verifier, err = newFingerprintVerifier(logf)
+		fv, err := fingerprint.New(desktop, logf)
 		if err != nil {
 			logf("fingerprint verification unavailable (%v)", err)
 			logf("continuing with the desktop prompt as the only check; pass -uv prompt to silence this")
-			verifier = nil
+			break
 		}
+		verifier = fv
 	case "prompt":
 		logf("user verification is the desktop prompt alone")
 	default:

@@ -22,11 +22,17 @@ type approver interface {
 	Confirm(title string, choices []string) (string, error)
 }
 
+// userVerifier is the biometric check. Verify returns false on a genuine
+// non-match and an error only when the check could not run at all.
+type userVerifier interface {
+	Verify(reason string) (bool, error)
+}
+
 type authenticator struct {
 	vault    *vault
 	approver approver
-	verifier *fingerprintVerifier // nil when biometric UV is off
-	strictUV bool                 // if set, a broken sensor denies instead of falling back
+	verifier userVerifier // nil when biometric UV is off
+	strictUV bool         // if set, a broken sensor denies instead of falling back
 	// fingerprintConsent drops the click-to-approve menu and treats the
 	// fingerprint touch as both consent and verification, the way Touch ID and
 	// Windows Hello do. The notification names the site before the scan, so
@@ -112,7 +118,7 @@ func (a *authenticator) verifyUserFor(rpID, reason string) bool {
 		a.logf("reusing the scan from moments ago for %s", rpID)
 		return true
 	}
-	ok, err := a.verifier.verify(reason)
+	ok, err := a.verifier.Verify(reason)
 	if err != nil {
 		if a.strictUV {
 			a.logf("fingerprint unavailable (%v); denying because -uv-strict is set", err)
