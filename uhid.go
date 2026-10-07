@@ -29,9 +29,13 @@ func openUHID() (*uhidDevice, error) {
 		return nil, fmt.Errorf("connect to UHID service at %s: %w (enable llavero-uhid@%d.service)", path, err, os.Getuid())
 	}
 	uid, err := hidbridge.PeerUID(conn)
-	if err != nil || uid != 0 {
+	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("UHID service must be owned by root (uid %d, error %v)", uid, err)
+		return nil, fmt.Errorf("checking UHID service credentials: %w", err)
+	}
+	if uid != 0 {
+		conn.Close()
+		return nil, fmt.Errorf("UHID service at %s runs as uid %d, not root; refusing to talk to it", path, uid)
 	}
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	ready := make([]byte, 2)
