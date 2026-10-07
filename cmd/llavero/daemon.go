@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -114,33 +115,39 @@ func (a *app) run() error {
 		Logger:             a.log.Named("ctap"),
 	})
 
+	// Signals are caught only from here on. Before this point Ctrl+C must
+	// still kill a passphrase prompt the default way.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Only now does the device appear, so browsers never see a key that
 	// cannot answer yet.
 	if err := dev.Create(); err != nil {
 		return err
 	}
-	shutdown := func() { _ = dev.Close() }
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		a.log.Info("shutting down")
-		shutdown()
-		_ = a.log.Sync()
-		os.Exit(0)
-	}()
+	// Closing the broker connection is what wakes dev.Read on shutdown.
+	stopClosing := context.AfterFunc(ctx, func() { _ = dev.Close() })
+	defer stopClosing()
 
-	go a.reportNode()
+	var background sync.WaitGroup
+	defer background.Wait()
+	background.Go(func() { a.reportNode(ctx) })
 
-	// Requests run under the daemon's lifetime; replaced by a signal-bound
-	// context once shutdown stops calling os.Exit.
-	ctx := context.Background()
+	// Requests get their own context so that leaving the loop for any reason
+	// closes an open prompt before stack.Wait waits for it.
+	reqCtx, cancelRequests := context.WithCancel(ctx)
 	stack := ctaphid.New(dev, auth.Handle, a.log.Named("ctaphid"))
+	defer stack.Wait()
+	defer cancelRequests()
 
 	for {
 		ev, err := dev.Read()
 		if err != nil {
+			if ctx.Err() != nil {
+				a.log.Info("shutting down")
+				return nil
+			}
 			return fmt.Errorf("UHID service: %w", err)
 		}
 		switch ev.Kind {
@@ -153,7 +160,7 @@ func (a *app) run() error {
 		case hidbridge.EventStop:
 			a.log.Debug("device stopped")
 		case hidbridge.EventOutput:
-			stack.HandlePacket(ctx, ev.Data)
+			stack.HandlePacket(reqCtx, ev.Data)
 		default:
 			a.log.Debug("unhandled device event", zap.Uint8("kind", ev.Kind))
 		}
@@ -163,9 +170,14 @@ func (a *app) run() error {
 // reportNode tells the user which hidraw node we became, and whether they can
 // actually reach it, which is the first thing to check if a browser cannot see
 // the key.
-func (a *app) reportNode() {
+func (a *app) reportNode(ctx context.Context) {
 	uniq := hidbridge.DeviceUniq(os.Getuid())
-	time.Sleep(400 * time.Millisecond)
+	// Give udev a moment to create the node.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(400 * time.Millisecond):
+	}
 	matches, _ := filepath.Glob("/sys/class/hidraw/hidraw*")
 	for _, m := range matches {
 		data, err := os.ReadFile(filepath.Join(m, "device", "uevent"))
