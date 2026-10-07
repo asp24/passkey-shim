@@ -2,6 +2,7 @@ package hidbridge
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -58,15 +59,16 @@ func startServer(t *testing.T, newDevice func() (Device, error)) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{UID: os.Getuid(), NewDevice: newDevice}
-	served := make(chan struct{})
-	go func() {
-		defer close(served)
-		_ = srv.Serve(listener)
-	}()
+	srv := &Server{UID: os.Getuid(), NewDevice: newDevice, Logf: t.Logf}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(ctx, listener) }()
+	// Serve waits for its sessions, so nothing logs after the test ends.
 	t.Cleanup(func() {
-		listener.Close()
-		<-served
+		cancel()
+		if err := <-served; err != nil {
+			t.Errorf("Serve() = %v after cancel, want nil", err)
+		}
 	})
 	return path
 }
@@ -125,6 +127,40 @@ func TestSessionRelaysBothDirections(t *testing.T) {
 
 	client.Close()
 	waitClosed(t, dev)
+}
+
+func TestCancelEndsActiveSession(t *testing.T) {
+	dev := newFakeDevice()
+	path := filepath.Join(t.TempDir(), "device.sock")
+	listener, err := Listen(path, os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{UID: os.Getuid(), NewDevice: func() (Device, error) { return dev, nil }}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(ctx, listener) }()
+
+	client := dialSelf(t, path)
+	if err := client.Create(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve() = %v, want nil", err)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("Serve did not return after cancel")
+	}
+	waitClosed(t, dev)
+	if _, err := client.Read(); err == nil {
+		t.Fatal("client still connected after shutdown")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket left behind: %v", err)
+	}
 }
 
 func TestNoDeviceBeforeCreate(t *testing.T) {

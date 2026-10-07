@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"llavero/internal/hidbridge"
 	"llavero/internal/uhid"
@@ -23,12 +26,15 @@ func main() {
 	if os.Geteuid() != 0 {
 		fatal("must run as root")
 	}
-	if err := serve(int(uid)); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := serve(ctx, int(uid)); err != nil {
 		fatal(err)
 	}
 }
 
-func serve(uid int) error {
+// serve runs until ctx is cancelled; the deferred Close unlinks the socket.
+func serve(ctx context.Context, uid int) error {
 	// systemd creates the root-owned runtime directory.
 	listener, err := hidbridge.Listen(hidbridge.SocketPath(uid), uid)
 	if err != nil {
@@ -40,7 +46,7 @@ func serve(uid int) error {
 		NewDevice: func() (hidbridge.Device, error) { return newKernelDevice(hidbridge.DeviceUniq(uid)) },
 		Logf:      log.New(os.Stdout, "", 0).Printf,
 	}
-	return srv.Serve(listener)
+	return srv.Serve(ctx, listener)
 }
 
 // kernelDevice adapts a /dev/uhid device to the broker protocol, so kernel

@@ -1,6 +1,7 @@
 package hidbridge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -46,13 +47,24 @@ func Listen(path string, uid int) (*net.UnixListener, error) {
 	return listener, nil
 }
 
-// Serve accepts clients until the listener fails. Connections from other
-// users, and any connection while a session is active, are dropped.
-func (s *Server) Serve(listener *net.UnixListener) error {
+// Serve accepts clients until ctx is done or the listener fails. Connections
+// from other users, and any connection while a session is active, are
+// dropped. On return the listener is closed and no session is left running.
+func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var sessions sync.WaitGroup
+	defer sessions.Wait()
+	defer cancel()
+	stopListener := context.AfterFunc(ctx, func() { listener.Close() })
+	defer stopListener()
+
 	var active sync.Mutex
 	for {
 		conn, err := listener.AcceptUnix()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return fmt.Errorf("accepting client: %w", err)
 		}
 		peer, err := PeerUID(conn)
@@ -64,14 +76,16 @@ func (s *Server) Serve(listener *net.UnixListener) error {
 			conn.Close()
 			continue
 		}
-		go func() {
+		sessions.Go(func() {
 			defer active.Unlock()
 			defer conn.Close()
+			stopConn := context.AfterFunc(ctx, func() { conn.Close() })
+			defer stopConn()
 			// A client closing its socket is the normal way a session ends.
-			if err := s.relay(conn); err != nil && !errors.Is(err, io.EOF) {
+			if err := s.relay(conn); err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil {
 				s.logf("client disconnected: %v", err)
 			}
-		}()
+		})
 	}
 }
 
