@@ -137,14 +137,17 @@ func (s *Server) relay(conn *net.UnixConn) error {
 		conn.Close()
 		done <- err
 	}()
+	// forwardReports only returns once the session is over, always with a
+	// reason. If the event reader failed first, that reason is just the socket
+	// the reader closed, and the reader's error is the one worth reporting.
 	err = forwardReports(conn, dev)
 	conn.Close()
 	dev.Close()
 	readerErr := <-done
-	if err != nil {
-		return err
+	if errors.Is(err, net.ErrClosed) {
+		return readerErr
 	}
-	return readerErr
+	return err
 }
 
 func awaitCreate(conn *net.UnixConn) error {

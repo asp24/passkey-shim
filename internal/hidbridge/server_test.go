@@ -8,11 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 const testTimeout = 2 * time.Second
@@ -304,5 +307,53 @@ func TestForwardReportsBoundary(t *testing.T) {
 				t.Fatalf("invalid report reached device: %v", err)
 			}
 		})
+	}
+}
+
+// brokenDevice fails its first read, as a device the kernel tore down would.
+type brokenDevice struct{ *fakeDevice }
+
+var errDeviceGone = errors.New("device gone")
+
+func (brokenDevice) Read() (Event, error) { return Event{}, errDeviceGone }
+
+// When the device fails, the log must name the device error rather than the
+// closed socket it causes on the other side of the relay.
+func TestSessionReportsDeviceFailure(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	path := filepath.Join(t.TempDir(), "device.sock")
+	listener, err := Listen(path, os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := brokenDevice{newFakeDevice()}
+	srv := &Server{UID: os.Getuid(), NewDevice: func() (Device, error) { return dev, nil }, Logger: zap.New(core)}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(ctx, listener) }()
+
+	client := dialSelf(t, path)
+	if err := client.Create(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(); err == nil {
+		t.Fatal("client still connected after the device failed")
+	}
+	waitClosed(t, dev.fakeDevice)
+	// The session logs after it returns; cancelling first would relabel it as
+	// a shutdown.
+	deadline := time.Now().Add(testTimeout)
+	for logs.FilterMessage("session ended abnormally").Len() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-served
+
+	ended := logs.FilterMessage("session ended abnormally").All()
+	if len(ended) != 1 {
+		t.Fatalf("got %d abnormal-session logs, want 1: %v", len(ended), logs.All())
+	}
+	if got, _ := ended[0].ContextMap()["error"].(string); !strings.Contains(got, errDeviceGone.Error()) {
+		t.Fatalf("logged error %q, want it to name %q", got, errDeviceGone)
 	}
 }
