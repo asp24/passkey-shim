@@ -9,13 +9,16 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"llavero/internal/tpm"
 	"llavero/internal/vault"
 )
 
 // loadVault opens an existing vault or creates one, asking only for the
 // factors the vault's own mode requires.
-func loadVault(opts options) (*vault.Vault, error) {
+func (a *app) loadVault() (*vault.Vault, error) {
+	opts := a.opts
 	_, statErr := os.Stat(opts.vaultPath)
 	isNew := errors.Is(statErr, os.ErrNotExist)
 
@@ -55,7 +58,7 @@ func loadVault(opts options) (*vault.Vault, error) {
 		if err != nil {
 			return nil, err
 		}
-		logf("created a new vault at %s (unlock: %s)", opts.vaultPath, mode)
+		a.log.Info("created a new vault", zap.String("path", opts.vaultPath), zap.Stringer("unlock", mode))
 		return v, nil
 	}
 
@@ -63,11 +66,13 @@ func loadVault(opts options) (*vault.Vault, error) {
 	if err != nil {
 		return nil, err
 	}
-	logf("unlocked %s (unlock: %s, %d passkey(s))", opts.vaultPath, v.Mode(), v.Count())
+	a.log.Info("unlocked the vault", zap.String("path", opts.vaultPath),
+		zap.Stringer("unlock", v.Mode()), zap.Int("passkeys", v.Count()))
 	return v, nil
 }
 
-func runRekey(opts options) error {
+func (a *app) runRekey() error {
+	opts := a.opts
 	newMode, err := vault.ParseUnlockMode(opts.rekeyTo)
 	if err != nil {
 		return err
@@ -78,12 +83,12 @@ func runRekey(opts options) error {
 		}
 	}
 
-	v, err := loadVault(opts)
+	v, err := a.loadVault()
 	if err != nil {
 		return err
 	}
 	if v.Mode() == newMode {
-		logf("vault is already in %s mode, nothing to do", newMode)
+		a.log.Info("vault is already in this mode, nothing to do", zap.Stringer("unlock", newMode))
 		return nil
 	}
 
@@ -93,7 +98,7 @@ func runRekey(opts options) error {
 	if err := copyFile(opts.vaultPath, backup); err != nil {
 		return fmt.Errorf("could not back up the vault, refusing to rekey: %w", err)
 	}
-	logf("backed up the existing vault to %s", backup)
+	a.log.Info("backed up the existing vault", zap.String("backup", backup))
 
 	var newPass []byte
 	if newMode.NeedsPassphrase() {
@@ -108,7 +113,7 @@ func runRekey(opts options) error {
 	if err := v.Rekey(newMode, newPass); err != nil {
 		return fmt.Errorf("rekey failed (your backup at %s is still good): %w", backup, err)
 	}
-	logf("rekeyed to %s, %d passkey(s) preserved", newMode, v.Count())
+	a.log.Info("rekeyed", zap.Stringer("unlock", newMode), zap.Int("passkeys", v.Count()))
 
 	// Prove the new file actually opens before declaring success.
 	check, err := vault.Open(opts.vaultPath, newPass, tpm.Sealer{})
@@ -118,7 +123,7 @@ func runRekey(opts options) error {
 	if check.Count() != v.Count() {
 		return fmt.Errorf("credential count changed during rekey (restore from %s)", backup)
 	}
-	logf("verified: the rekeyed vault reopens and still holds %d passkey(s)", check.Count())
+	a.log.Info("verified: the rekeyed vault reopens", zap.Int("passkeys", check.Count()))
 	return nil
 }
 
@@ -132,8 +137,8 @@ func copyFile(src, dst string) error {
 
 // runList prints what is in the vault. Useful on its own, and the only way to
 // find the id of something worth deleting.
-func runList(opts options) error {
-	v, err := loadVault(opts)
+func (a *app) runList() error {
+	v, err := a.loadVault()
 	if err != nil {
 		return err
 	}
@@ -159,14 +164,15 @@ func runList(opts options) error {
 // runForget deletes credentials by site or by credential id prefix. It always
 // shows what it is about to remove and asks first: there is no undo, and a
 // deleted passkey may be the only way into an account.
-func runForget(opts options) error {
+func (a *app) runForget() error {
+	opts := a.opts
 	if serviceHasOpen(opts.vaultPath) {
 		return errors.New("the llavero service is running against this vault and holds its own\n" +
 			"       copy in memory, so its next write would resurrect anything deleted here.\n" +
 			"       Stop it first:  systemctl --user stop llavero.service")
 	}
 
-	v, err := loadVault(opts)
+	v, err := a.loadVault()
 	if err != nil {
 		return err
 	}
@@ -206,7 +212,7 @@ func runForget(opts options) error {
 	if err != nil {
 		return err
 	}
-	logf("deleted %d passkey(s), %d remaining", len(gone), v.Count())
+	a.log.Info("deleted passkeys", zap.Int("deleted", len(gone)), zap.Int("remaining", v.Count()))
 	return nil
 }
 

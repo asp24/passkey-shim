@@ -3,6 +3,7 @@ package hardening
 import (
 	"testing"
 
+	"go.uber.org/zap/zaptest"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,7 +22,7 @@ func TestHardeningDisablesCoreDumps(t *testing.T) {
 	}
 	t.Logf("RLIMIT_CORE before: cur=%d max=%d", before.Cur, before.Max)
 
-	Apply(false, func(format string, args ...any) { t.Logf(format, args...) })
+	Apply(false, zaptest.NewLogger(t))
 
 	var after unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_CORE, &after); err != nil {

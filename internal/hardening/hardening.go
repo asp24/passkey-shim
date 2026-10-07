@@ -16,7 +16,8 @@ package hardening
 
 import (
 	"fmt"
-	"strings"
+
+	"go.uber.org/zap"
 
 	"golang.org/x/sys/unix"
 )
@@ -27,29 +28,29 @@ import (
 // Nothing here is fatal. A machine that refuses one of these is still better
 // served by a working authenticator than by no authenticator, and the log says
 // exactly what did not apply.
-func Apply(lockMemory bool, logf func(string, ...any)) {
-	applied := noCoreDumps(logf)
+func Apply(lockMemory bool, log *zap.Logger) {
+	applied := noCoreDumps(log)
 
 	if lockMemory {
-		if s := lockAllMemory(logf); s != "" {
+		if s := lockAllMemory(log); s != "" {
 			applied = append(applied, s)
 		}
 	}
 
 	if len(applied) > 0 {
-		logf("hardening: %s", strings.Join(applied, ", "))
+		log.Info("process hardened", zap.Strings("applied", applied))
 	}
 }
 
 // noCoreDumps stops the process image reaching disk, two ways, because they
 // fail independently.
-func noCoreDumps(logf func(string, ...any)) []string {
+func noCoreDumps(log *zap.Logger) []string {
 	var applied []string
 
 	// A hard limit of zero cannot be raised again, even by this process.
 	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{Cur: 0, Max: 0}); err != nil {
-		logf("WARNING: could not disable core dumps (%v); a crash may write "+
-			"every private key to disk", err)
+		log.Warn("could not disable core dumps; a crash may write every private key to disk",
+			zap.Error(err))
 	} else {
 		applied = append(applied, "core dumps off")
 	}
@@ -63,11 +64,11 @@ func noCoreDumps(logf func(string, ...any)) []string {
 	// indicator it is often assumed to be, so a readback is the only honest
 	// confirmation.
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
-		logf("WARNING: could not clear the dumpable flag (%v); other processes "+
-			"running as you may be able to read this one's memory", err)
+		log.Warn("could not clear the dumpable flag; other processes running as you "+
+			"may be able to read this one's memory", zap.Error(err))
 	} else if dumpable() != 0 {
-		logf("WARNING: the dumpable flag did not stick; other processes running " +
-			"as you may be able to read this one's memory")
+		log.Warn("the dumpable flag did not stick; other processes running as you " +
+			"may be able to read this one's memory")
 	} else {
 		applied = append(applied, "not dumpable, no same-user ptrace")
 	}
@@ -77,7 +78,7 @@ func noCoreDumps(logf func(string, ...any)) []string {
 
 // lockAllMemory keeps pages out of swap. It returns a description of what took
 // effect, or "" if nothing did.
-func lockAllMemory(logf func(string, ...any)) string {
+func lockAllMemory(log *zap.Logger) string {
 	// Raise the soft limit to the hard limit first. An unprivileged process
 	// may do that much, and it is often enough on its own.
 	var lim unix.Rlimit
@@ -94,12 +95,10 @@ func lockAllMemory(logf func(string, ...any)) string {
 	// runtime panic rather than a recoverable error. So check for headroom
 	// first and decline rather than arm a landmine.
 	if err := unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE); err != nil {
-		logf("WARNING: could not lock memory (%v)", err)
-		logf("         keys may be written to swap. RLIMIT_MEMLOCK is %s;",
-			describeLimit(lim.Cur))
-		logf("         raise it with LimitMEMLOCK=64M in the systemd unit, or")
-		logf("         pass -mlock=false to stop trying and silence this")
-		logf("         (harmless if your swap is on an encrypted volume)")
+		log.Warn("could not lock memory; keys may be written to swap. Raise it with "+
+			"LimitMEMLOCK=64M in the systemd unit, or pass -mlock=false to stop trying "+
+			"(harmless if your swap is on an encrypted volume)",
+			zap.String("memlock_limit", describeLimit(lim.Cur)), zap.Error(err))
 		return ""
 	}
 	return fmt.Sprintf("memory locked (limit %s)", describeLimit(lim.Cur))

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"go.uber.org/zap"
 )
 
 const (
@@ -42,18 +43,18 @@ type Prompter interface {
 type Verifier struct {
 	username string
 	prompter Prompter
-	logf     func(string, ...any)
+	log      *zap.Logger
 }
 
 // New checks that fprintd has a sensor with a finger enrolled for the current
 // user, so a missing enrolment shows up at startup rather than at the first
 // sign-in.
-func New(prompter Prompter, logf func(string, ...any)) (*Verifier, error) {
+func New(prompter Prompter, log *zap.Logger) (*Verifier, error) {
 	u, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("looking up current user: %w", err)
 	}
-	fv := &Verifier{username: u.Username, prompter: prompter, logf: logf}
+	fv := &Verifier{username: u.Username, prompter: prompter, log: log}
 
 	conn, err := dbus.SystemBus()
 	if err != nil {
@@ -71,7 +72,7 @@ func New(prompter Prompter, logf func(string, ...any)) (*Verifier, error) {
 	if len(fingers) == 0 {
 		return nil, fmt.Errorf("no fingerprints enrolled for %s (run fprintd-enroll)", fv.username)
 	}
-	logf("fingerprint verification enabled (%d finger(s) enrolled)", len(fingers))
+	log.Info("fingerprint verification enabled", zap.Int("enrolled_fingers", len(fingers)))
 	return fv, nil
 }
 
@@ -130,7 +131,7 @@ func (fv *Verifier) Verify(reason string) (bool, error) {
 
 	fv.prompter.Prompt("Touch the fingerprint sensor", reason)
 	defer fv.prompter.DismissPrompt()
-	fv.logf("waiting for fingerprint: %s", reason)
+	fv.log.Info("waiting for fingerprint", zap.String("reason", reason))
 
 	deadline := time.After(fingerprintTimeout)
 	for {
@@ -149,7 +150,7 @@ func (fv *Verifier) Verify(reason string) (bool, error) {
 			if !done {
 				// Retryable conditions: finger moved, scan too short. The
 				// sensor keeps reading, so keep waiting.
-				fv.logf("fingerprint retry: %s", result)
+				fv.log.Info("fingerprint retry", zap.String("result", result))
 				continue
 			}
 			switch result {

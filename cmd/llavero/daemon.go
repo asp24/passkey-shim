@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.uber.org/zap"
+
 	"llavero/internal/approval"
 	"llavero/internal/ctap"
 	"llavero/internal/ctaphid"
@@ -17,19 +19,20 @@ import (
 	"llavero/internal/hidbridge"
 )
 
-func run(opts options) error {
+func (a *app) run() error {
+	opts := a.opts
 	// Before anything touches a key. Core dumps and ptrace are shut off first
 	// so there is no window in which a decrypted vault could escape.
-	hardening.Apply(opts.mlock, logf)
+	hardening.Apply(opts.mlock, a.log.Named("hardening"))
 
 	if opts.rekeyTo != "" {
-		return runRekey(opts)
+		return a.runRekey()
 	}
 	if opts.list {
-		return runList(opts)
+		return a.runList()
 	}
 	if opts.forget != "" {
-		return runForget(opts)
+		return a.runForget()
 	}
 
 	// Connect to the broker before asking for a passphrase, so a missing
@@ -40,14 +43,14 @@ func run(opts options) error {
 	}
 	defer dev.Close()
 
-	v, err := loadVault(opts)
+	v, err := a.loadVault()
 	if err != nil {
 		return err
 	}
 
 	var ap ctap.Approver
 	if opts.autoApprove {
-		logf("WARNING: -auto-approve is set. Every request will be granted without asking.")
+		a.log.Warn("-auto-approve is set: every request will be granted without asking")
 		ap = approval.Auto{}
 	} else {
 		ap, err = approval.NewMenu()
@@ -65,15 +68,15 @@ func run(opts options) error {
 		if opts.autoApprove {
 			break // testing mode skips biometrics too
 		}
-		fv, err := fingerprint.New(desktop, logf)
+		fv, err := fingerprint.New(a.desktop, a.log.Named("fingerprint"))
 		if err != nil {
-			logf("fingerprint verification unavailable (%v)", err)
-			logf("continuing with the desktop prompt as the only check; pass -uv prompt to silence this")
+			a.log.Warn("fingerprint verification unavailable; the desktop prompt is the only check "+
+				"(pass -uv prompt to silence this)", zap.Error(err))
 			break
 		}
 		verifier = fv
 	case "prompt":
-		logf("user verification is the desktop prompt alone")
+		a.log.Info("user verification is the desktop prompt alone")
 	default:
 		return fmt.Errorf("unknown -uv value %q (want fingerprint or prompt)", opts.uv)
 	}
@@ -85,29 +88,29 @@ func run(opts options) error {
 		if verifier == nil {
 			// Without a sensor this would leave no user interaction at all, so
 			// fall back rather than let a page mint passkeys in silence.
-			logf("-consent fingerprint needs a working sensor; falling back to the approval prompt")
+			a.log.Warn("-consent fingerprint needs a working sensor; falling back to the approval prompt")
 		} else {
 			fingerprintConsent = true
-			logf("consent is the fingerprint touch alone; no approval click")
+			a.log.Info("consent is the fingerprint touch alone; no approval click")
 		}
 	default:
 		return fmt.Errorf("unknown -consent value %q (want prompt or fingerprint)", opts.consent)
 	}
 
 	if opts.uvGrace > 0 && verifier != nil {
-		logf("repeat requests from the same site within %s reuse the previous scan", opts.uvGrace)
+		a.log.Info("repeat requests from the same site reuse the previous scan", zap.Duration("grace", opts.uvGrace))
 	}
 
 	auth := ctap.New(ctap.Config{
 		Store:              vaultStore{v},
 		Approver:           ap,
 		Verifier:           verifier,
-		Notifier:           desktop,
+		Notifier:           a.desktop,
 		StrictUV:           opts.uvStrict,
 		FingerprintConsent: fingerprintConsent,
 		UVGrace:            opts.uvGrace,
 		AAGUID:             aaguid,
-		Logf:               logf,
+		Logf:               a.log.Named("ctap").Sugar().Infof,
 	})
 
 	// Only now does the device appear, so browsers never see a key that
@@ -121,14 +124,15 @@ func run(opts options) error {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		logf("shutting down")
+		a.log.Info("shutting down")
 		shutdown()
+		_ = a.log.Sync()
 		os.Exit(0)
 	}()
 
-	go reportNode()
+	go a.reportNode()
 
-	stack := ctaphid.New(dev, auth.Handle, vlogf)
+	stack := ctaphid.New(dev, auth.Handle, a.log.Named("ctaphid").Sugar().Debugf)
 
 	for {
 		ev, err := dev.Read()
@@ -137,17 +141,17 @@ func run(opts options) error {
 		}
 		switch ev.Kind {
 		case hidbridge.EventStart:
-			logf("authenticator is live, waiting for a browser")
+			a.log.Info("authenticator is live, waiting for a browser")
 		case hidbridge.EventOpen:
-			vlogf("device opened by a client")
+			a.log.Debug("device opened by a client")
 		case hidbridge.EventClose:
-			vlogf("device closed by a client")
+			a.log.Debug("device closed by a client")
 		case hidbridge.EventStop:
-			vlogf("UHID_STOP")
+			a.log.Debug("device stopped")
 		case hidbridge.EventOutput:
 			stack.HandlePacket(ev.Data)
 		default:
-			vlogf("uhid event type %d", ev.Kind)
+			a.log.Debug("unhandled device event", zap.Uint8("kind", ev.Kind))
 		}
 	}
 }
@@ -155,7 +159,7 @@ func run(opts options) error {
 // reportNode tells the user which hidraw node we became, and whether they can
 // actually reach it, which is the first thing to check if a browser cannot see
 // the key.
-func reportNode() {
+func (a *app) reportNode() {
 	uniq := hidbridge.DeviceUniq(os.Getuid())
 	time.Sleep(400 * time.Millisecond)
 	matches, _ := filepath.Glob("/sys/class/hidraw/hidraw*")
@@ -167,12 +171,12 @@ func reportNode() {
 		node := "/dev/" + filepath.Base(m)
 		if f, err := os.OpenFile(node, os.O_RDWR, 0); err == nil {
 			f.Close()
-			logf("presenting as %s, readable by this user", node)
+			a.log.Info("presenting as a hidraw node readable by this user", zap.String("node", node))
 		} else {
-			logf("presenting as %s, but THIS USER CANNOT OPEN IT: %v", node, err)
-			logf("browsers will not see the key until that is fixed")
+			a.log.Error("this user cannot open our hidraw node; browsers will not see the key "+
+				"until that is fixed", zap.String("node", node), zap.Error(err))
 		}
 		return
 	}
-	logf("warning: could not locate our hidraw node")
+	a.log.Warn("could not locate our hidraw node")
 }

@@ -11,6 +11,9 @@ import (
 	"os"
 	"time"
 
+	"go.uber.org/zap"
+
+	"llavero/internal/logging"
 	"llavero/internal/notify"
 	"llavero/internal/tpm"
 	"llavero/internal/vault"
@@ -23,20 +26,13 @@ var aaguid = [16]byte{
 	0xa7, 0x60, 0xc3, 0x18, 0xe5, 0x02, 0xbb, 0x46,
 }
 
-var verbose bool
-
-// desktop is shared by every component that talks to the user, so a sticky
-// prompt raised by one can be replaced or dismissed by another.
-var desktop = &notify.Desktop{}
-
-func logf(format string, args ...any) {
-	fmt.Printf("%s  %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
-}
-
-func vlogf(format string, args ...any) {
-	if verbose {
-		logf(format, args...)
-	}
+// app carries the parsed options and the dependencies every command shares.
+type app struct {
+	opts options
+	log  *zap.Logger
+	// desktop is shared by every component that talks to the user, so a
+	// sticky prompt raised by one can be replaced or dismissed by another.
+	desktop *notify.Desktop
 }
 
 type options struct {
@@ -75,17 +71,20 @@ func main() {
 	flag.IntVar(&opts.passFD, "passphrase-fd", -1, "read the vault passphrase from this file descriptor")
 	flag.IntVar(&opts.newPassFD, "new-passphrase-fd", -1, "read the NEW passphrase for -rekey from this file descriptor")
 	flag.Parse()
-	verbose = *verboseFlag
 
+	log := logging.New(*verboseFlag)
+	a := &app{opts: opts, log: log, desktop: &notify.Desktop{}}
+
+	var err error
 	if *tpmSelftest {
-		if err := tpm.SelfTest(logf); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		return
+		err = tpm.SelfTest(log.Named("tpm"))
+	} else {
+		err = a.run()
 	}
-
-	if err := run(opts); err != nil {
+	_ = log.Sync()
+	if err != nil {
+		// The final error is addressed to the person at the terminal and may
+		// span several lines of advice, so it is printed rather than logged.
 		fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
 		os.Exit(1)
 	}
