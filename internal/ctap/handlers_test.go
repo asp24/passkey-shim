@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
-	"math/big"
 	"testing"
 
 	"go.uber.org/zap/zaptest"
@@ -191,7 +190,14 @@ func register(t *testing.T, a *Authenticator, rpID string) ([]byte, *ecdsa.Publi
 	if err := ctapDecMode.Unmarshal(ad[55+credLen:], &key); err != nil {
 		t.Fatal(err)
 	}
-	pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: new(big.Int).SetBytes(key.X), Y: new(big.Int).SetBytes(key.Y)}
+	if len(key.X) != 32 || len(key.Y) != 32 {
+		t.Fatalf("coordinates are %d and %d bytes, want 32", len(key.X), len(key.Y))
+	}
+	point := append(append([]byte{0x04}, key.X...), key.Y...)
+	pub, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), point)
+	if err != nil {
+		t.Fatalf("registered public key is invalid: %v", err)
+	}
 	return credID, pub
 }
 
@@ -387,4 +393,41 @@ func TestGetInfoAdvertisesPasskeys(t *testing.T) {
 	if !info.Options["rk"] || !bytes.Equal(info.AAGUID, []byte{1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) {
 		t.Fatalf("getInfo = %+v", info)
 	}
+}
+
+// A coordinate that starts with a zero byte must still encode as 32 bytes, or
+// relying parties reject the key. About one key in 256 has one, so search for
+// such a key instead of hoping a random one hits it.
+func TestCOSEKeyKeepsLeadingZeros(t *testing.T) {
+	a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, nil)
+	for range 10000 {
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		point, err := priv.PublicKey.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if point[1] != 0 && point[33] != 0 {
+			continue
+		}
+		credID := []byte("cred")
+		attested, err := a.attestedCredentialData(credID, priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var key coseKey
+		if err := ctapDecMode.Unmarshal(attested[16+2+len(credID):], &key); err != nil {
+			t.Fatal(err)
+		}
+		if len(key.X) != 32 || len(key.Y) != 32 {
+			t.Fatalf("coordinates encoded as %d and %d bytes, want 32", len(key.X), len(key.Y))
+		}
+		if !bytes.Equal(append(append([]byte{0x04}, key.X...), key.Y...), point) {
+			t.Fatal("COSE coordinates do not match the public key")
+		}
+		return
+	}
+	t.Fatal("no key with a leading zero coordinate in 10000 tries")
 }

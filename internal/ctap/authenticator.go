@@ -457,16 +457,19 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 // attestedCredentialData builds the attestation block embedded in authData at
 // registration: aaguid, credential id, then the COSE public key.
 func (a *Authenticator) attestedCredentialData(credID []byte, priv *ecdsa.PrivateKey) ([]byte, error) {
-	pub := priv.PublicKey
+	// The uncompressed SEC 1 point is 0x04 || X || Y with each coordinate
+	// fixed at 32 bytes, which is exactly what COSE wants. A coordinate with
+	// leading zero bytes must not encode short, or the RP rejects the key.
+	point, err := priv.PublicKey.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("encoding public key: %w", err)
+	}
 	key := coseKey{
 		Kty: 2, // EC2
 		Alg: algES256,
 		Crv: 1, // P-256
-		// Fixed 32-byte big-endian coordinates. FillBytes matters here:
-		// a coordinate with leading zero bytes would otherwise encode short
-		// and the RP would reject the key.
-		X: pub.X.FillBytes(make([]byte, 32)),
-		Y: pub.Y.FillBytes(make([]byte, 32)),
+		X:   point[1:33],
+		Y:   point[33:65],
 	}
 	coseBytes, err := ctapEncMode.Marshal(key)
 	if err != nil {

@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"math/big"
 	"os"
 
 	"github.com/fxamacker/cbor/v2"
@@ -228,15 +227,18 @@ func parseAuthData(b []byte, attested bool) (*parsedAuthData, error) {
 	if len(ck.X) != 32 || len(ck.Y) != 32 {
 		return nil, fmt.Errorf("coordinates must be 32 bytes, got x=%d y=%d", len(ck.X), len(ck.Y))
 	}
-	p.PubKey = &ecdsa.PublicKey{
-		Curve: elliptic.P256(),
-		X:     new(big.Int).SetBytes(ck.X),
-		Y:     new(big.Int).SetBytes(ck.Y),
+	pub, err := p256Key(ck.X, ck.Y)
+	if err != nil {
+		return nil, fmt.Errorf("public key is not a valid P-256 point: %w", err)
 	}
-	if !p.PubKey.Curve.IsOnCurve(p.PubKey.X, p.PubKey.Y) {
-		return nil, fmt.Errorf("public key is not on the P-256 curve")
-	}
+	p.PubKey = pub
 	return p, nil
+}
+
+// p256Key builds a public key from fixed-size coordinates. Parsing rejects a
+// point that is not on the curve.
+func p256Key(x, y []byte) (*ecdsa.PublicKey, error) {
+	return ecdsa.ParseUncompressedPublicKey(elliptic.P256(), append(append([]byte{0x04}, x...), y...))
 }
 
 func main() {
@@ -298,14 +300,12 @@ func main() {
 		if raw, err := os.ReadFile(*statePath); err == nil {
 			var saved savedRegistration
 			if json.Unmarshal(raw, &saved) == nil {
-				reg = &parsedAuthData{
-					CredID: saved.CredID,
-					PubKey: &ecdsa.PublicKey{
-						Curve: elliptic.P256(),
-						X:     new(big.Int).SetBytes(saved.X),
-						Y:     new(big.Int).SetBytes(saved.Y),
-					},
+				pub, err := p256Key(saved.X, saved.Y)
+				if err != nil {
+					fail("saved registration in %s holds an invalid key: %v", *statePath, err)
+					os.Exit(1)
 				}
+				reg = &parsedAuthData{CredID: saved.CredID, PubKey: pub}
 				reusing = true
 				pass("reusing credential  %x… registered before the restart", saved.CredID[:6])
 			}
@@ -362,11 +362,12 @@ func main() {
 		pass("  public key        P-256, on curve, 32-byte coordinates")
 
 		if *statePath != "" {
-			saved := savedRegistration{
-				CredID: reg.CredID,
-				X:      reg.PubKey.X.FillBytes(make([]byte, 32)),
-				Y:      reg.PubKey.Y.FillBytes(make([]byte, 32)),
+			point, err := reg.PubKey.Bytes()
+			if err != nil {
+				fail("could not encode the public key for saving: %v", err)
+				os.Exit(1)
 			}
+			saved := savedRegistration{CredID: reg.CredID, X: point[1:33], Y: point[33:65]}
 			raw, _ := json.Marshal(saved)
 			if err := os.WriteFile(*statePath, raw, 0o600); err != nil {
 				fail("could not save registration state: %v", err)
