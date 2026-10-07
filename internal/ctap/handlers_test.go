@@ -11,6 +11,8 @@ import (
 	"errors"
 	"math/big"
 	"testing"
+
+	"go.uber.org/zap/zaptest"
 )
 
 // memStore is an in-memory Store.
@@ -117,8 +119,8 @@ type nopNotifier struct{}
 
 func (nopNotifier) Notify(string, string) {}
 
-func newTestAuthenticator(store Store, ap Approver, uv UserVerifier, mutate ...func(*Config)) *Authenticator {
-	cfg := Config{Store: store, Approver: ap, Notifier: nopNotifier{}, AAGUID: [16]byte{1, 2, 3}}
+func newTestAuthenticator(t *testing.T, store Store, ap Approver, uv UserVerifier, mutate ...func(*Config)) *Authenticator {
+	cfg := Config{Store: store, Approver: ap, Notifier: nopNotifier{}, AAGUID: [16]byte{1, 2, 3}, Logger: zaptest.NewLogger(t)}
 	if uv != nil {
 		cfg.Verifier = uv
 	}
@@ -194,7 +196,7 @@ func register(t *testing.T, a *Authenticator, rpID string) ([]byte, *ecdsa.Publi
 }
 
 func TestRegisterThenSignVerifies(t *testing.T) {
-	a := newTestAuthenticator(&memStore{}, fakeApprover{}, nil)
+	a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, nil)
 	credID, pub := register(t, a, "example.test")
 
 	for wantCount := uint32(1); wantCount <= 2; wantCount++ {
@@ -253,11 +255,11 @@ func TestMakeCredentialRefusals(t *testing.T) {
 			store := &memStore{}
 			req := tt.req()
 			if tt.existing {
-				id, _ := register(t, newTestAuthenticator(store, fakeApprover{}, nil), "example.test")
+				id, _ := register(t, newTestAuthenticator(t, store, fakeApprover{}, nil), "example.test")
 				req.ExcludeList = []credentialDescriptor{{Type: "public-key", ID: id}}
 			}
 			before := len(store.creds)
-			a := newTestAuthenticator(store, tt.approver, nil)
+			a := newTestAuthenticator(t, store, tt.approver, nil)
 			resp := a.Handle(command(t, ctapMakeCredential, req))
 			if resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
@@ -282,8 +284,8 @@ func TestGetAssertionRefusals(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := &memStore{}
-			register(t, newTestAuthenticator(store, fakeApprover{}, nil), "example.test")
-			a := newTestAuthenticator(store, tt.approver, nil)
+			register(t, newTestAuthenticator(t, store, fakeApprover{}, nil), "example.test")
+			a := newTestAuthenticator(t, store, tt.approver, nil)
 			resp := a.Handle(command(t, ctapGetAssertion, signRequest(tt.rpID)))
 			if resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
@@ -296,7 +298,7 @@ func TestGetAssertionRefusals(t *testing.T) {
 }
 
 func TestMalformedRequests(t *testing.T) {
-	a := newTestAuthenticator(&memStore{}, fakeApprover{}, nil)
+	a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, nil)
 	tests := []struct {
 		name    string
 		payload []byte
@@ -334,7 +336,7 @@ func TestUserVerificationOutcomes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			uv := &fakeVerifier{match: tt.match, err: tt.err}
-			a := newTestAuthenticator(&memStore{}, fakeApprover{}, uv, func(c *Config) { c.StrictUV = tt.strict })
+			a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, uv, func(c *Config) { c.StrictUV = tt.strict })
 			resp := a.Handle(command(t, ctapMakeCredential, registerRequest("example.test")))
 			if resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
@@ -347,12 +349,12 @@ func TestUserVerificationOutcomes(t *testing.T) {
 // for a different one.
 func TestGraceWindowIsPerSite(t *testing.T) {
 	store := &memStore{}
-	setup := newTestAuthenticator(store, fakeApprover{}, nil)
+	setup := newTestAuthenticator(t, store, fakeApprover{}, nil)
 	register(t, setup, "example.test")
 	register(t, setup, "other.test")
 
 	uv := &fakeVerifier{match: true}
-	a := newTestAuthenticator(store, fakeApprover{}, uv, func(c *Config) { c.UVGrace = 1 << 40 })
+	a := newTestAuthenticator(t, store, fakeApprover{}, uv, func(c *Config) { c.UVGrace = 1 << 40 })
 	for _, rpID := range []string{"example.test", "example.test", "other.test"} {
 		if resp := a.Handle(command(t, ctapGetAssertion, signRequest(rpID))); resp[0] != statusOK {
 			t.Fatalf("%s: status 0x%02x", rpID, resp[0])
@@ -365,7 +367,7 @@ func TestGraceWindowIsPerSite(t *testing.T) {
 
 // Fingerprint consent must not silently approve when no sensor exists.
 func TestFingerprintConsentNeedsVerifier(t *testing.T) {
-	a := newTestAuthenticator(&memStore{}, fakeApprover{decline: true}, nil, func(c *Config) { c.FingerprintConsent = true })
+	a := newTestAuthenticator(t, &memStore{}, fakeApprover{decline: true}, nil, func(c *Config) { c.FingerprintConsent = true })
 	resp := a.Handle(command(t, ctapMakeCredential, registerRequest("example.test")))
 	if resp[0] != statusOperationDenied {
 		t.Fatalf("status 0x%02x; consent was skipped without a sensor", resp[0])
@@ -373,7 +375,7 @@ func TestFingerprintConsentNeedsVerifier(t *testing.T) {
 }
 
 func TestGetInfoAdvertisesPasskeys(t *testing.T) {
-	a := newTestAuthenticator(&memStore{}, fakeApprover{}, nil)
+	a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, nil)
 	resp := a.Handle([]byte{ctapGetInfo})
 	if resp[0] != statusOK {
 		t.Fatalf("status 0x%02x", resp[0])

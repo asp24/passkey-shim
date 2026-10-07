@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"go.uber.org/zap"
 )
 
 // Credential is a stored passkey as the authenticator needs it.
@@ -80,7 +83,8 @@ type Config struct {
 	UVGrace time.Duration
 	// AAGUID identifies the authenticator model.
 	AAGUID [16]byte
-	Logf   func(format string, args ...any)
+	// Logger records every decision. Nil discards it.
+	Logger *zap.Logger
 }
 
 // Authenticator handles CTAP2 commands. Handle is safe to call from several
@@ -94,7 +98,7 @@ type Authenticator struct {
 	fingerprintConsent bool
 	uvGrace            time.Duration
 	aaguid             [16]byte
-	logf               func(string, ...any)
+	log                *zap.Logger
 
 	graceMu   sync.Mutex
 	graceRP   string
@@ -104,9 +108,9 @@ type Authenticator struct {
 // New builds an Authenticator from cfg. Store, Approver and Notifier are
 // required.
 func New(cfg Config) *Authenticator {
-	logf := cfg.Logf
-	if logf == nil {
-		logf = func(string, ...any) {}
+	log := cfg.Logger
+	if log == nil {
+		log = zap.NewNop()
 	}
 	return &Authenticator{
 		store:              cfg.Store,
@@ -117,7 +121,7 @@ func New(cfg Config) *Authenticator {
 		fingerprintConsent: cfg.FingerprintConsent,
 		uvGrace:            cfg.UVGrace,
 		aaguid:             cfg.AAGUID,
-		logf:               logf,
+		log:                log,
 	}
 }
 
@@ -156,11 +160,11 @@ func (a *Authenticator) requestConsent(rpID, title, affirmative, reason string) 
 	}
 	choice, err := a.approver.Confirm(title, []string{affirmative, "Cancel"})
 	if err != nil {
-		a.logf("could not ask for approval: %v", err)
+		a.log.Warn("could not ask for approval", zap.String("reason", reason), zap.Error(err))
 		return false
 	}
 	if choice != affirmative {
-		a.logf("declined by user: %s", reason)
+		a.log.Info("declined by user", zap.String("reason", reason))
 		return false
 	}
 	return a.verifyUserFor(rpID, reason)
@@ -181,22 +185,22 @@ func (a *Authenticator) verifyUserFor(rpID, reason string) bool {
 		return true
 	}
 	if rpID != "" && a.recentlyVerified(rpID) {
-		a.logf("reusing the scan from moments ago for %s", rpID)
+		a.log.Info("reusing the scan from moments ago", zap.String("rp", rpID))
 		return true
 	}
 	ok, err := a.verifier.Verify(reason)
 	if err != nil {
 		if a.strictUV {
-			a.logf("fingerprint unavailable (%v); denying because -uv-strict is set", err)
+			a.log.Warn("fingerprint unavailable; denying because strict verification is on", zap.Error(err))
 			a.notifier.Notify("Fingerprint unavailable", "Request denied")
 			return false
 		}
-		a.logf("fingerprint unavailable (%v); accepting the desktop approval alone", err)
+		a.log.Warn("fingerprint unavailable; accepting the desktop approval alone", zap.Error(err))
 		a.notifier.Notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
 		return true
 	}
 	if !ok {
-		a.logf("fingerprint did not match")
+		a.log.Info("fingerprint did not match", zap.String("reason", reason))
 		a.notifier.Notify("Fingerprint did not match", reason)
 		return false
 	}
@@ -228,10 +232,10 @@ func (a *Authenticator) Handle(payload []byte) []byte {
 	case ctapReset:
 		// Wiping every passkey on an unauthenticated USB command is not a
 		// trade we want, so this stays refused.
-		a.logf("refusing authenticatorReset")
+		a.log.Warn("refusing authenticatorReset")
 		return []byte{statusOperationDenied}
 	default:
-		a.logf("unimplemented CTAP2 command 0x%02x", cmd)
+		a.log.Info("unimplemented CTAP2 command", zap.Uint8("command", cmd))
 		return []byte{statusNotAllowed}
 	}
 }
@@ -250,7 +254,7 @@ func (a *Authenticator) getInfo() []byte {
 	}
 	body, err := ctapEncMode.Marshal(info)
 	if err != nil {
-		a.logf("getInfo encode failed: %v", err)
+		a.log.Error("getInfo: encode failed", zap.Error(err))
 		return []byte{statusOther}
 	}
 	return append([]byte{statusOK}, body...)
@@ -267,7 +271,7 @@ func (a *Authenticator) selection() []byte {
 func (a *Authenticator) makeCredential(body []byte) []byte {
 	var req makeCredentialRequest
 	if err := ctapDecMode.Unmarshal(body, &req); err != nil {
-		a.logf("makeCredential: malformed request: %v", err)
+		a.log.Info("makeCredential: malformed request", zap.Error(err))
 		return []byte{statusInvalidParameter}
 	}
 	if req.RP.ID == "" || len(req.ClientDataHash) != 32 {
@@ -281,14 +285,14 @@ func (a *Authenticator) makeCredential(body []byte) []byte {
 	// An RP ID is a domain, so a leading or trailing dot can never be a real
 	// origin and is safe to refuse outright.
 	if !isPlausibleRPID(req.RP.ID) {
-		a.logf("makeCredential: refusing throwaway registration for %q", req.RP.ID)
+		a.log.Info("makeCredential: refusing throwaway registration", zap.String("rp", req.RP.ID))
 		return []byte{statusUnsupportedAlgo}
 	}
 
 	// We only speak ES256. Refusing early gives the browser a clean error
 	// instead of a credential it cannot verify.
 	if !supportsES256(req.PubKeyCredParams) {
-		a.logf("makeCredential: RP %q did not offer ES256", req.RP.ID)
+		a.log.Info("makeCredential: relying party did not offer ES256", zap.String("rp", req.RP.ID))
 		return []byte{statusUnsupportedAlgo}
 	}
 
@@ -296,7 +300,7 @@ func (a *Authenticator) makeCredential(body []byte) []byte {
 	// spec wants user presence before we admit it, but a desktop prompt for a
 	// duplicate registration is noise, so we answer directly.
 	if a.store.HasCredentialFor(req.RP.ID, descriptorIDs(req.ExcludeList)) {
-		a.logf("makeCredential: %s already has a credential in the exclude list", req.RP.ID)
+		a.log.Info("makeCredential: a credential in the exclude list already exists", zap.String("rp", req.RP.ID))
 		return []byte{statusCredentialExcluded}
 	}
 
@@ -315,13 +319,13 @@ func (a *Authenticator) makeCredential(body []byte) []byte {
 
 	credID, priv, err := a.store.AddCredential(req.RP, req.User)
 	if err != nil {
-		a.logf("makeCredential: vault write failed: %v", err)
+		a.log.Error("makeCredential: storing the credential failed", zap.String("rp", req.RP.ID), zap.Error(err))
 		return []byte{statusOther}
 	}
 
 	attested, err := a.attestedCredentialData(credID, priv)
 	if err != nil {
-		a.logf("makeCredential: encoding public key failed: %v", err)
+		a.log.Error("makeCredential: encoding the public key failed", zap.Error(err))
 		return []byte{statusOther}
 	}
 
@@ -337,11 +341,12 @@ func (a *Authenticator) makeCredential(body []byte) []byte {
 	}
 	out, err := ctapEncMode.Marshal(resp)
 	if err != nil {
-		a.logf("makeCredential: encode failed: %v", err)
+		a.log.Error("makeCredential: encode failed", zap.Error(err))
 		return []byte{statusOther}
 	}
 
-	a.logf("registered passkey for %s (%s), credential %x", req.RP.ID, label, credID[:8])
+	a.log.Info("registered passkey", zap.String("rp", req.RP.ID), zap.String("account", label),
+		zap.String("credential", hex.EncodeToString(credID[:8])))
 	a.notifier.Notify("Passkey created", fmt.Sprintf("%s (%s)", req.RP.ID, label))
 	return append([]byte{statusOK}, out...)
 }
@@ -349,7 +354,7 @@ func (a *Authenticator) makeCredential(body []byte) []byte {
 func (a *Authenticator) getAssertion(body []byte) []byte {
 	var req getAssertionRequest
 	if err := ctapDecMode.Unmarshal(body, &req); err != nil {
-		a.logf("getAssertion: malformed request: %v", err)
+		a.log.Info("getAssertion: malformed request", zap.Error(err))
 		return []byte{statusInvalidParameter}
 	}
 	if req.RPID == "" || len(req.ClientDataHash) != 32 {
@@ -358,7 +363,7 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 
 	matches := a.store.FindForRP(req.RPID, descriptorIDs(req.AllowList))
 	if len(matches) == 0 {
-		a.logf("getAssertion: no credential for %s", req.RPID)
+		a.log.Info("getAssertion: no credential for this site", zap.String("rp", req.RPID))
 		return []byte{statusNoCredentials}
 	}
 
@@ -375,7 +380,7 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 		choice, err := a.approver.Confirm(
 			fmt.Sprintf("Sign in to %s as:", req.RPID), labels)
 		if err != nil || choice == "" {
-			a.logf("getAssertion: declined or timed out for %s", req.RPID)
+			a.log.Info("getAssertion: account choice declined or timed out", zap.String("rp", req.RPID), zap.Error(err))
 			return []byte{statusOperationDenied}
 		}
 		idx := indexOf(labels, choice)
@@ -405,13 +410,13 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 
 	priv, err := parsePrivateKey(chosen.PrivateKey)
 	if err != nil {
-		a.logf("getAssertion: stored key unusable: %v", err)
+		a.log.Error("getAssertion: stored key unusable", zap.String("rp", req.RPID), zap.Error(err))
 		return []byte{statusOther}
 	}
 
 	count, err := a.store.BumpSignCount(chosen.ID)
 	if err != nil {
-		a.logf("getAssertion: could not persist sign count: %v", err)
+		a.log.Error("getAssertion: could not persist the sign count", zap.String("rp", req.RPID), zap.Error(err))
 		return []byte{statusOther}
 	}
 
@@ -424,7 +429,7 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 	digest := sha256.Sum256(signed)
 	sig, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
 	if err != nil {
-		a.logf("getAssertion: signing failed: %v", err)
+		a.log.Error("getAssertion: signing failed", zap.Error(err))
 		return []byte{statusOther}
 	}
 
@@ -440,11 +445,12 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 	}
 	out, err := ctapEncMode.Marshal(resp)
 	if err != nil {
-		a.logf("getAssertion: encode failed: %v", err)
+		a.log.Error("getAssertion: encode failed", zap.Error(err))
 		return []byte{statusOther}
 	}
 
-	a.logf("signed assertion for %s (%s), counter now %d", req.RPID, chosen.UserName, count)
+	a.log.Info("signed assertion", zap.String("rp", req.RPID), zap.String("account", chosen.UserName),
+		zap.Uint32("sign_count", count))
 	return append([]byte{statusOK}, out...)
 }
 

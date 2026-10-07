@@ -110,7 +110,7 @@ func (a *app) run() error {
 		FingerprintConsent: fingerprintConsent,
 		UVGrace:            opts.uvGrace,
 		AAGUID:             aaguid,
-		Logf:               a.log.Named("ctap").Sugar().Infof,
+		Logger:             a.log.Named("ctap"),
 	})
 
 	// Only now does the device appear, so browsers never see a key that
@@ -132,7 +132,7 @@ func (a *app) run() error {
 
 	go a.reportNode()
 
-	stack := ctaphid.New(dev, auth.Handle, a.log.Named("ctaphid").Sugar().Debugf)
+	stack := ctaphid.New(dev, auth.Handle, a.log.Named("ctaphid"))
 
 	for {
 		ev, err := dev.Read()

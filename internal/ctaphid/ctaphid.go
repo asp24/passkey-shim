@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"math/rand"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 const (
@@ -69,25 +71,26 @@ type Transport struct {
 	pending map[uint32]*assembly
 	nextCID uint32
 	onCBOR  func(payload []byte) []byte
-	logf    func(format string, args ...any)
+	log     *zap.Logger
 }
 
 // New returns a Transport that answers through dev and passes each CTAP2
-// message to onCBOR, whose return value is sent back as the response.
-func New(dev ReportSender, onCBOR func([]byte) []byte, logf func(string, ...any)) *Transport {
+// message to onCBOR, whose return value is sent back as the response. Frames
+// are logged at debug level, transport faults at warn.
+func New(dev ReportSender, onCBOR func([]byte) []byte, log *zap.Logger) *Transport {
 	return &Transport{
 		dev:     dev,
 		pending: make(map[uint32]*assembly),
 		nextCID: rand.Uint32() | 1,
 		onCBOR:  onCBOR,
-		logf:    logf,
+		log:     log,
 	}
 }
 
 // HandlePacket consumes one 64-byte host-to-device packet.
 func (c *Transport) HandlePacket(p []byte) {
 	if len(p) < 5 {
-		c.logf("runt packet (%d bytes), ignoring", len(p))
+		c.log.Debug("ignoring runt packet", zap.Int("bytes", len(p)))
 		return
 	}
 	if len(p) < packetSize {
@@ -134,12 +137,12 @@ func (c *Transport) HandlePacket(p []byte) {
 	// continuation packet
 	a, ok := c.pending[cid]
 	if !ok {
-		c.logf("continuation for idle channel %08x, ignoring", cid)
+		c.log.Debug("ignoring continuation for idle channel", cidField(cid))
 		return
 	}
 	seq := p[4]
 	if seq != a.nextSeq {
-		c.logf("bad sequence on %08x: got %d want %d", cid, seq, a.nextSeq)
+		c.log.Warn("bad continuation sequence", cidField(cid), zap.Uint8("got", seq), zap.Uint8("want", a.nextSeq))
 		delete(c.pending, cid)
 		c.sendError(cid, errInvalidSeq)
 		return
@@ -166,7 +169,7 @@ func (c *Transport) handleInit(cid uint32, nonce []byte) {
 		}
 		newCID = c.nextCID
 	}
-	c.logf("CTAPHID_INIT on %08x -> allocated channel %08x", cid, newCID)
+	c.log.Debug("CTAPHID_INIT", cidField(cid), zap.String("allocated", fmt.Sprintf("%08x", newCID)))
 
 	resp := make([]byte, 17)
 	copy(resp[0:8], nonce)
@@ -182,24 +185,25 @@ func (c *Transport) handleInit(cid uint32, nonce []byte) {
 func (c *Transport) dispatch(cid uint32, a *assembly) {
 	switch a.cmd {
 	case cmdPing:
-		c.logf("CTAPHID_PING on %08x (%d bytes), echoing", cid, len(a.payload))
+		c.log.Debug("CTAPHID_PING", cidField(cid), zap.Int("bytes", len(a.payload)))
 		c.sendMessage(cid, cmdPing, a.payload)
 	case cmdCBOR:
 		if len(a.payload) == 0 {
 			c.sendError(cid, errInvalidLen)
 			return
 		}
-		c.logf("CTAPHID_CBOR on %08x: %s (%d bytes)", cid, describeCBORCommand(a.payload[0]), len(a.payload))
+		c.log.Debug("CTAPHID_CBOR", cidField(cid),
+			zap.String("command", describeCBORCommand(a.payload[0])), zap.Int("bytes", len(a.payload)))
 		c.runWithKeepalive(cid, a.payload)
 	case cmdWink:
-		c.logf("CTAPHID_WINK on %08x", cid)
+		c.log.Debug("CTAPHID_WINK", cidField(cid))
 		c.sendMessage(cid, cmdWink, nil)
 	case cmdMsg:
 		// We advertise NMSG, so a well-behaved host never sends this.
-		c.logf("CTAPHID_MSG on %08x (legacy U2F), refusing", cid)
+		c.log.Debug("refusing legacy U2F CTAPHID_MSG", cidField(cid))
 		c.sendError(cid, errInvalidCmd)
 	default:
-		c.logf("unhandled CTAPHID command 0x%02x on %08x", a.cmd, cid)
+		c.log.Debug("unhandled CTAPHID command", cidField(cid), zap.Uint8("command", a.cmd))
 		c.sendError(cid, errInvalidCmd)
 	}
 }
@@ -235,7 +239,7 @@ func (c *Transport) sendKeepalive(cid uint32, status byte) {
 	binary.BigEndian.PutUint16(pkt[5:7], 1)
 	pkt[7] = status
 	if err := c.dev.SendInput(pkt); err != nil {
-		c.logf("keepalive send failed: %v", err)
+		c.log.Warn("keepalive send failed", cidField(cid), zap.Error(err))
 	}
 }
 
@@ -257,7 +261,7 @@ func (c *Transport) sendMessage(cid uint32, cmd byte, payload []byte) {
 	}
 	copy(pkt[7:], payload[:n])
 	if err := c.dev.SendInput(pkt); err != nil {
-		c.logf("send failed: %v", err)
+		c.log.Warn("send failed", cidField(cid), zap.Error(err))
 		return
 	}
 	sent := n
@@ -273,17 +277,20 @@ func (c *Transport) sendMessage(cid uint32, cmd byte, payload []byte) {
 		}
 		copy(cont[5:], payload[sent:sent+n])
 		if err := c.dev.SendInput(cont); err != nil {
-			c.logf("send failed: %v", err)
+			c.log.Warn("send failed", cidField(cid), zap.Error(err))
 			return
 		}
 		sent += n
 		seq++
 		if seq > 0x7F {
-			c.logf("message too long to fragment")
+			c.log.Error("message too long to fragment", cidField(cid), zap.Int("bytes", len(payload)))
 			return
 		}
 	}
 }
+
+// cidField renders a channel id the way the CTAP spec writes them.
+func cidField(cid uint32) zap.Field { return zap.String("cid", fmt.Sprintf("%08x", cid)) }
 
 func describeCBORCommand(b byte) string {
 	switch b {

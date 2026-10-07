@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"sync"
 	"testing"
+
+	"go.uber.org/zap"
 )
 
 // recorder captures every report the transport sends to the host.
@@ -72,7 +74,7 @@ func newTestTransport(onCBOR func([]byte) []byte) (*Transport, *recorder) {
 	if onCBOR == nil {
 		onCBOR = func([]byte) []byte { return nil }
 	}
-	return New(rec, onCBOR, func(string, ...any) {}), rec
+	return New(rec, onCBOR, zap.NewNop()), rec
 }
 
 func TestInitAllocatesChannel(t *testing.T) {
