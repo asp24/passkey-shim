@@ -9,8 +9,9 @@ package uhid
 import (
 	"encoding/binary"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"os"
+
+	"golang.org/x/sys/unix"
 )
 
 // Kernel event kinds from linux/uhid.h.
