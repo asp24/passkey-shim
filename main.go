@@ -26,6 +26,7 @@ import (
 	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
 	"llavero/internal/notify"
+	"llavero/internal/tpm"
 )
 
 // aaguid identifies the authenticator model, not the user or the installation.
@@ -90,7 +91,7 @@ func main() {
 	verbose = *verboseFlag
 
 	if *tpmSelftest {
-		if err := runTPMSelftest(); err != nil {
+		if err := tpm.SelfTest(logf); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -125,7 +126,7 @@ func loadVault(opts options) (*vault, error) {
 	}
 
 	if mode.needsTPM() {
-		if err := tpmAvailable(); err != nil {
+		if err := tpm.Available(); err != nil {
 			return nil, err
 		}
 	}
@@ -163,7 +164,7 @@ func runRekey(opts options) error {
 		return err
 	}
 	if newMode.needsTPM() {
-		if err := tpmAvailable(); err != nil {
+		if err := tpm.Available(); err != nil {
 			return err
 		}
 	}
@@ -461,56 +462,6 @@ func reportNode() {
 		return
 	}
 	logf("warning: could not locate our hidraw node")
-}
-
-// runTPMSelftest proves the TPM path works on this machine: seal a known
-// secret, unseal it, and confirm the bytes survive.
-func runTPMSelftest() error {
-	if err := tpmAvailable(); err != nil {
-		return err
-	}
-	logf("TPM device is reachable")
-
-	secret := make([]byte, tpmSecretLen)
-	for i := range secret {
-		secret[i] = byte(i * 7)
-	}
-
-	blob, err := sealToTPM(secret)
-	if err != nil {
-		return err
-	}
-	logf("sealed a %d-byte secret into a %d-byte blob", len(secret), len(blob))
-
-	got, err := unsealFromTPM(blob)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(got, secret) {
-		return errors.New("unsealed bytes do not match what was sealed")
-	}
-	logf("unsealed and matched")
-
-	// Two seals of the same secret must differ, or the TPM is not adding its
-	// own entropy to the wrapping and something is very wrong.
-	blob2, err := sealToTPM(secret)
-	if err != nil {
-		return err
-	}
-	if bytes.Equal(blob, blob2) {
-		return errors.New("two seals of the same secret produced identical blobs")
-	}
-	logf("re-sealing produced a distinct blob, as it should")
-
-	bad := append([]byte{}, blob...)
-	bad[len(bad)-1] ^= 0xFF
-	if _, err := unsealFromTPM(bad); err == nil {
-		return errors.New("a corrupted blob unsealed successfully, which must not happen")
-	}
-	logf("a corrupted blob was correctly rejected")
-
-	fmt.Println("\nTPM selftest passed")
-	return nil
 }
 
 // runList prints what is in the vault. Useful on its own, and the only way to

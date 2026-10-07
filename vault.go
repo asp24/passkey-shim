@@ -28,6 +28,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"llavero/internal/tpm"
 )
 
 const (
@@ -40,6 +42,7 @@ const (
 	headerLenV1     = 4 + 1 + saltLen + nonceLen     // 33
 	headerLenV2     = 4 + 1 + 1 + saltLen + nonceLen // 34
 	credentialIDLen = 32
+	tpmSecretLen    = 32
 )
 
 // unlockMode records which factors are needed to derive the vault key.
@@ -229,7 +232,7 @@ func openVault(path string, passphrase []byte) (*vault, error) {
 		if err != nil {
 			return nil, fmt.Errorf("this vault is TPM-bound but its sealed blob is unreadable: %w", err)
 		}
-		tpmSecret, err = unsealFromTPM(blob)
+		tpmSecret, err = tpm.Sealer{}.Unseal(blob)
 		if err != nil {
 			return nil, err
 		}
@@ -280,7 +283,7 @@ func createVault(path string, mode unlockMode, passphrase []byte) (*vault, error
 		if _, err := rand.Read(tpmSecret); err != nil {
 			return nil, err
 		}
-		blob, err := sealToTPM(tpmSecret)
+		blob, err := tpm.Sealer{}.Seal(tpmSecret)
 		if err != nil {
 			return nil, err
 		}
@@ -320,7 +323,7 @@ func (v *vault) rekey(mode unlockMode, passphrase []byte) error {
 		if _, err := rand.Read(tpmSecret); err != nil {
 			return err
 		}
-		blob, err := sealToTPM(tpmSecret)
+		blob, err := tpm.Sealer{}.Seal(tpmSecret)
 		if err != nil {
 			return err
 		}

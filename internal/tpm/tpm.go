@@ -1,6 +1,4 @@
-package main
-
-// TPM binding.
+// Package tpm seals small secrets to this machine's TPM.
 //
 // A 32-byte secret is sealed to this machine's TPM and mixed into the vault
 // key. The sealed blob is useless on any other machine, so a copied vault file
@@ -11,6 +9,7 @@ package main
 // update is worse than one that does not resist an attacker who already has
 // code execution on the running machine. Machine binding is the goal here;
 // defending the live system is the approval prompt's job.
+package tpm
 
 import (
 	"encoding/binary"
@@ -26,10 +25,7 @@ import (
 	"github.com/google/go-tpm/tpm2/transport/linuxtpm"
 )
 
-const (
-	tpmDevice    = "/dev/tpmrm0"
-	tpmSecretLen = 32
-)
+const tpmDevice = "/dev/tpmrm0"
 
 // sealedObjectTemplate describes a keyedHash object holding opaque data.
 // FixedTPM and FixedParent are what make the blob non-duplicable: the TPM
@@ -45,7 +41,9 @@ var sealedObjectTemplate = tpm2.TPMTPublic{
 	},
 }
 
-func tpmAvailable() error {
+// Available checks that the TPM resource manager can be opened, and explains
+// the fix when it cannot.
+func Available() error {
 	f, err := os.OpenFile(tpmDevice, os.O_RDWR, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
@@ -91,8 +89,11 @@ func withPrimary(fn func(tpm transport.TPM, srk tpm2.AuthHandle) error) error {
 	})
 }
 
-// sealToTPM seals secret and returns a blob to store on disk.
-func sealToTPM(secret []byte) ([]byte, error) {
+// Sealer seals secrets to this machine's TPM. The zero value is ready to use.
+type Sealer struct{}
+
+// Seal seals secret and returns a blob to store on disk.
+func (Sealer) Seal(secret []byte) ([]byte, error) {
 	var blob []byte
 	err := withPrimary(func(tpm transport.TPM, srk tpm2.AuthHandle) error {
 		create := tpm2.Create{
@@ -116,9 +117,9 @@ func sealToTPM(secret []byte) ([]byte, error) {
 	return blob, err
 }
 
-// unsealFromTPM recovers the secret from a blob produced by sealToTPM on this
-// same machine.
-func unsealFromTPM(blob []byte) ([]byte, error) {
+// Unseal recovers the secret from a blob produced by Seal on this same
+// machine.
+func (Sealer) Unseal(blob []byte) ([]byte, error) {
 	pubBytes, privBytes, err := decodeBlob(blob)
 	if err != nil {
 		return nil, err
@@ -164,9 +165,6 @@ func unsealFromTPM(blob []byte) ([]byte, error) {
 	})
 	if err != nil {
 		return nil, err
-	}
-	if len(secret) != tpmSecretLen {
-		return nil, fmt.Errorf("unsealed secret has wrong length %d", len(secret))
 	}
 	return secret, nil
 }
