@@ -1,8 +1,7 @@
-package main
-
-// User-facing approval. Every credential creation and every assertion goes
-// through here, so that a compromised browser tab cannot silently mint or use
-// a passkey.
+// Package approval asks the user to approve an operation. Every credential
+// creation and every assertion goes through here, so that a compromised
+// browser tab cannot silently mint or use a passkey.
+package approval
 
 import (
 	"bytes"
@@ -20,19 +19,14 @@ import (
 // dialog the browser has already given up on.
 const approvalTimeout = 45 * time.Second
 
-type approver interface {
-	// confirm blocks until the user decides. A false return denies the
-	// operation; an error means we could not ask at all, which also denies.
-	confirm(title string, choices []string) (string, error)
-}
-
-// menuApprover drives Omarchy's native picker, so the dialog matches the rest
-// of the desktop instead of introducing another toolkit.
-type menuApprover struct {
+// Menu drives Omarchy's native picker, so the dialog matches the rest of the
+// desktop instead of introducing another toolkit.
+type Menu struct {
 	binary string
 }
 
-func newMenuApprover() (*menuApprover, error) {
+// NewMenu finds the picker and checks that a display is available to show it.
+func NewMenu() (*Menu, error) {
 	path, err := exec.LookPath("omarchy-menu-select")
 	if err != nil {
 		return nil, errors.New("omarchy-menu-select not found on PATH")
@@ -43,10 +37,13 @@ func newMenuApprover() (*menuApprover, error) {
 	if os.Getenv("WAYLAND_DISPLAY") == "" && os.Getenv("DISPLAY") == "" {
 		return nil, errors.New("no WAYLAND_DISPLAY or DISPLAY in the environment, so no prompt could be shown")
 	}
-	return &menuApprover{binary: path}, nil
+	return &Menu{binary: path}, nil
 }
 
-func (m *menuApprover) confirm(title string, choices []string) (string, error) {
+// Confirm shows title with choices and blocks until the user picks one. An
+// empty choice means the user dismissed the prompt; an error means the prompt
+// could not be shown at all.
+func (m *Menu) Confirm(title string, choices []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), approvalTimeout)
 	defer cancel()
 
@@ -80,10 +77,11 @@ func (m *menuApprover) confirm(title string, choices []string) (string, error) {
 	return choice, nil
 }
 
-// autoApprover approves everything. Intended for headless testing only; main
-// refuses to select it without an explicit flag.
-type autoApprover struct{}
+// Auto approves everything by picking the first choice. Intended for headless
+// testing only; the daemon selects it only behind an explicit flag.
+type Auto struct{}
 
-func (autoApprover) confirm(title string, choices []string) (string, error) {
+// Confirm returns the first choice without asking anyone.
+func (Auto) Confirm(title string, choices []string) (string, error) {
 	return choices[0], nil
 }

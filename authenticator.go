@@ -16,6 +16,12 @@ import (
 	"unicode/utf8"
 )
 
+type approver interface {
+	// Confirm blocks until the user decides. An empty choice denies the
+	// operation; an error means we could not ask at all, which also denies.
+	Confirm(title string, choices []string) (string, error)
+}
+
 type authenticator struct {
 	vault    *vault
 	approver approver
@@ -71,7 +77,7 @@ func (a *authenticator) requestConsent(rpID, title, affirmative, reason string) 
 	if a.consentIsFingerprint() {
 		return a.verifyUserFor(rpID, reason)
 	}
-	choice, err := a.approver.confirm(title, []string{affirmative, "Cancel"})
+	choice, err := a.approver.Confirm(title, []string{affirmative, "Cancel"})
 	if err != nil {
 		a.logf("could not ask for approval: %v", err)
 		return false
@@ -179,7 +185,7 @@ func (a *authenticator) getInfo() []byte {
 }
 
 func (a *authenticator) selection() []byte {
-	choice, err := a.approver.confirm("Use Llavero for this site?", []string{"Use it", "Cancel"})
+	choice, err := a.approver.Confirm("Use Llavero for this site?", []string{"Use it", "Cancel"})
 	if err != nil || choice != "Use it" {
 		return []byte{statusOperationDenied}
 	}
@@ -294,7 +300,7 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 				Name: c.UserName, DisplayName: c.UserDisplay,
 			}))
 		}
-		choice, err := a.approver.confirm(
+		choice, err := a.approver.Confirm(
 			fmt.Sprintf("Sign in to %s as:", req.RPID), labels)
 		if err != nil || choice == "" {
 			a.logf("getAssertion: declined or timed out for %s", req.RPID)

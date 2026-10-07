@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/term"
 
+	"llavero/internal/approval"
 	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
 	"llavero/internal/notify"
@@ -241,9 +242,9 @@ func run(opts options) error {
 	var ap approver
 	if opts.autoApprove {
 		logf("WARNING: -auto-approve is set. Every request will be granted without asking.")
-		ap = autoApprover{}
+		ap = approval.Auto{}
 	} else {
-		ap, err = newMenuApprover()
+		ap, err = approval.NewMenu()
 		if err != nil {
 			return fmt.Errorf("no approval UI available: %w\n"+
 				"       (omarchy-menu-select is required, or run with -auto-approve for testing)", err)
