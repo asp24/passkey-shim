@@ -1,0 +1,29 @@
+[Unit]
+Description=Llavero FIDO HID broker for UID %i
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/llavero/llavero-uhid -uid %i
+RuntimeDirectory=llavero-uhid-%i
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+User=root
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_CHOWN
+DevicePolicy=closed
+DeviceAllow=/dev/uhid rw
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

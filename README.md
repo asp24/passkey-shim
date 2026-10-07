@@ -3,7 +3,7 @@
 A software FIDO2 authenticator for Linux. It registers a virtual FIDO HID
 device with the kernel, so browsers discover it exactly the way they discover a
 hardware security key: no browser extension, no native messaging host, no
-account, no daemon socket to go wrong.
+account. A small system broker owns the virtual device.
 
 Passkeys live in a single AES-256-GCM encrypted file, sealed to this machine's
 TPM, and every use requires a fingerprint.
@@ -32,16 +32,33 @@ Presenting as a USB security key sidesteps all of it.
 
 ## Setup
 
-One-time, so the daemon can create HID devices without root:
+The user daemon never opens `/dev/uhid`. A small root system service creates
+one fixed FIDO HID device per configured user and forwards only 64-byte FIDO
+reports over a Unix socket. It checks the client's UID with `SO_PEERCRED`;
+the client also checks that the broker is root. The UHID descriptor and file
+descriptor stay inside the broker. One client may connect at a time, and its
+device disappears when it disconnects.
+
+Install and enable the broker once:
 
 ```sh
-echo 'KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess"' | \
-  sudo tee /etc/udev/rules.d/70-uhid-uaccess.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uhid
+go build -o /tmp/llavero-uhid ./cmd/llavero-uhid
+sudo install -Dm755 /tmp/llavero-uhid /usr/lib/llavero/llavero-uhid
+sudo install -m644 packaging/llavero-uhid@.service /etc/systemd/system/
+sudo modprobe uhid
+echo uhid | sudo tee /etc/modules-load.d/llavero.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now "llavero-uhid@$(id -u).service"
 ```
 
+When migrating from an older installation, remove the old
+`70-uhid-uaccess.rules` from `/etc/udev/rules.d/` (and `/usr/lib/udev/rules.d/`
+if installed there), reload udev rules, and trigger `/dev/uhid` to revoke the
+old user ACL (check with `getfacl /dev/uhid` and remove any remaining user ACL
+with `sudo setfacl -b /dev/uhid`). Do not grant users direct access to `/dev/uhid`.
+
 For TPM binding, grant the active local user access to the TPM resource
-manager the same way:
+manager with a udev rule:
 
 ```sh
 echo 'SUBSYSTEM=="tpmrm", KERNEL=="tpmrm[0-9]*", TAG+="uaccess"' | \

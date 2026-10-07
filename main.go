@@ -217,11 +217,13 @@ func run(opts options) error {
 		return runForget(opts)
 	}
 
-	// Check device access before asking for a passphrase, so a permissions
-	// problem does not cost the user a typed secret first.
-	if err := checkUHIDAccess(); err != nil {
+	// Connect to the broker before asking for a passphrase, so a missing
+	// system service does not cost the user a typed secret first.
+	dev, err := openUHID()
+	if err != nil {
 		return err
 	}
+	defer dev.conn.Close()
 
 	v, err := loadVault(opts)
 	if err != nil {
@@ -289,21 +291,7 @@ func run(opts options) error {
 		logf:               logf,
 	}
 
-	dev, err := openUHID()
-	if err != nil {
-		return err
-	}
-	if err := dev.create("Llavero (virtual FIDO2)"); err != nil {
-		return err
-	}
-
-	// Always tear the device down. A leaked virtual key would keep appearing
-	// in the browser's picker with nothing behind it.
-	shutdown := func() {
-		_ = dev.destroy()
-		_ = dev.f.Close()
-	}
-	defer shutdown()
+	shutdown := func() { _ = dev.conn.Close() }
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -321,7 +309,7 @@ func run(opts options) error {
 	for {
 		ev, err := dev.read()
 		if err != nil {
-			return fmt.Errorf("reading from /dev/uhid: %w", err)
+			return fmt.Errorf("reading from UHID service: %w", err)
 		}
 		switch ev.kind {
 		case uhidStart:
@@ -338,28 +326,6 @@ func run(opts options) error {
 			vlogf("uhid event type %d", ev.kind)
 		}
 	}
-}
-
-// checkUHIDAccess turns the usual permission failure into an actionable
-// message, since the fix is a one-line udev rule rather than anything obvious.
-func checkUHIDAccess() error {
-	f, err := os.OpenFile("/dev/uhid", os.O_RDWR, 0)
-	if err == nil {
-		f.Close()
-		return nil
-	}
-	if errors.Is(err, os.ErrPermission) {
-		return fmt.Errorf("no access to /dev/uhid.\n"+
-			"       Install the udev rule that grants it to the logged-in user:\n\n"+
-			"         echo 'KERNEL==\"uhid\", SUBSYSTEM==\"misc\", TAG+=\"uaccess\"' | \\\n"+
-			"           sudo tee /etc/udev/rules.d/70-uhid-uaccess.rules\n"+
-			"         sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uhid\n\n"+
-			"       (underlying error: %v)", err)
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("/dev/uhid is missing. Load the module with: sudo modprobe uhid")
-	}
-	return fmt.Errorf("opening /dev/uhid: %w", err)
 }
 
 func readPassphrase(passFD int, confirm bool, adjective string) ([]byte, error) {

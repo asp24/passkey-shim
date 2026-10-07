@@ -1,3 +1,0 @@
-# Let the logged-in user create virtual HID devices, which llavero needs to
-# present itself as a FIDO security key. /dev/uhid is root-only by default.
-KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess"

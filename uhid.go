@@ -1,158 +1,76 @@
 package main
 
-// Minimal binding for the kernel's /dev/uhid character device.
-//
-// The kernel ABI is a single packed C struct (struct uhid_event) whose body is
-// a union of every request type, so every read and write is against fixed byte
-// offsets into one oversized buffer. Offsets below come from linux/uhid.h.
-
 import (
-	"encoding/binary"
 	"fmt"
+	"llavero/internal/hidbridge"
+	"net"
 	"os"
+	"time"
 )
 
 const (
-	uhidDestroy = 1
-	uhidStart   = 2
-	uhidStop    = 3
-	uhidOpen    = 4
-	uhidClose   = 5
-	uhidOutput  = 6
-	uhidCreate2 = 11
-	uhidInput2  = 12
-
-	// 4-byte type tag plus the largest union member (create2, 4372 bytes).
-	uhidEventSize = 4376
-
-	busUSB = 0x03
+	uhidStart  = 2
+	uhidStop   = 3
+	uhidOpen   = 4
+	uhidClose  = 5
+	uhidOutput = 6
 )
 
-// create2 field offsets, measured from the start of the event.
-const (
-	offName    = 4   // [128]u8
-	offPhys    = 132 // [64]u8
-	offUniq    = 196 // [64]u8
-	offRDSize  = 260 // u16
-	offBus     = 262 // u16
-	offVendor  = 264 // u32
-	offProduct = 268 // u32
-	offVersion = 272 // u32
-	offCountry = 276 // u32
-	offRDData  = 280 // [4096]u8
-)
-
-// The FIDO HID report descriptor: usage page 0xF1D0, 64-byte in and out
-// reports. udev's 60-fido-id.rules looks for exactly this to tag the resulting
-// hidraw node as a security token, which is what makes browsers pick it up.
-var fidoReportDescriptor = []byte{
-	0x06, 0xD0, 0xF1, // Usage Page (FIDO Alliance)
-	0x09, 0x01, //       Usage (U2F HID Authenticator Device)
-	0xA1, 0x01, //       Collection (Application)
-	0x09, 0x20, //         Usage (Input Report Data)
-	0x15, 0x00, //         Logical Minimum (0)
-	0x26, 0xFF, 0x00, //   Logical Maximum (255)
-	0x75, 0x08, //         Report Size (8)
-	0x95, 0x40, //         Report Count (64)
-	0x81, 0x02, //         Input (Data,Var,Abs)
-	0x09, 0x21, //         Usage (Output Report Data)
-	0x15, 0x00, //         Logical Minimum (0)
-	0x26, 0xFF, 0x00, //   Logical Maximum (255)
-	0x75, 0x08, //         Report Size (8)
-	0x95, 0x40, //         Report Count (64)
-	0x91, 0x02, //         Output (Data,Var,Abs)
-	0xC0, //             End Collection
-}
-
-type uhidDevice struct {
-	f *os.File
+type uhidDevice struct{ conn *net.UnixConn }
+type uhidEvent struct {
+	kind uint32
+	data []byte
 }
 
 func openUHID() (*uhidDevice, error) {
-	f, err := os.OpenFile("/dev/uhid", os.O_RDWR, 0)
+	path := hidbridge.SocketPath(os.Getuid())
+	conn, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{Name: path, Net: "unixpacket"})
 	if err != nil {
-		return nil, fmt.Errorf("open /dev/uhid (needs root): %w", err)
+		return nil, fmt.Errorf("connect to UHID service at %s: %w (enable llavero-uhid@%d.service)", path, err, os.Getuid())
 	}
-	return &uhidDevice{f: f}, nil
-}
-
-// create registers the virtual device with the kernel, which materialises a
-// /dev/hidraw* node for it.
-func (d *uhidDevice) create(name string) error {
-	ev := make([]byte, uhidEventSize)
-	binary.LittleEndian.PutUint32(ev[0:], uhidCreate2)
-	copy(ev[offName:offName+127], name)
-	copy(ev[offPhys:offPhys+63], "llavero")
-	copy(ev[offUniq:offUniq+63], "llavero-0")
-	binary.LittleEndian.PutUint16(ev[offRDSize:], uint16(len(fidoReportDescriptor)))
-	binary.LittleEndian.PutUint16(ev[offBus:], busUSB)
-	binary.LittleEndian.PutUint32(ev[offVendor:], 0x1209)  // pid.codes, open-source VID
-	binary.LittleEndian.PutUint32(ev[offProduct:], 0x000C) // arbitrary within that space
-	binary.LittleEndian.PutUint32(ev[offVersion:], 1)
-	binary.LittleEndian.PutUint32(ev[offCountry:], 0)
-	copy(ev[offRDData:], fidoReportDescriptor)
-
-	if _, err := d.f.Write(ev); err != nil {
-		return fmt.Errorf("UHID_CREATE2: %w", err)
+	uid, err := hidbridge.PeerUID(conn)
+	if err != nil || uid != 0 {
+		conn.Close()
+		return nil, fmt.Errorf("UHID service must be owned by root (uid %d, error %v)", uid, err)
 	}
-	return nil
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	ready := make([]byte, 2)
+	n, err := conn.Read(ready)
+	if err != nil || n != 1 || ready[0] != 0 {
+		conn.Close()
+		return nil, fmt.Errorf("UHID service did not create a device (check its system journal): %v", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+	return &uhidDevice{conn: conn}, nil
 }
-
-func (d *uhidDevice) destroy() error {
-	ev := make([]byte, 4)
-	binary.LittleEndian.PutUint32(ev[0:], uhidDestroy)
-	_, err := d.f.Write(ev)
-	return err
-}
-
-// sendInput pushes one 64-byte report from device to host.
 func (d *uhidDevice) sendInput(report []byte) error {
-	ev := make([]byte, 6+len(report))
-	binary.LittleEndian.PutUint32(ev[0:], uhidInput2)
-	binary.LittleEndian.PutUint16(ev[4:], uint16(len(report)))
-	copy(ev[6:], report)
-	_, err := d.f.Write(ev)
+	if len(report) != 64 {
+		return fmt.Errorf("FIDO report must be 64 bytes")
+	}
+	_, err := d.conn.Write(report)
 	return err
 }
-
-type uhidEvent struct {
-	kind uint32
-	data []byte // populated for uhidOutput
-}
-
 func (d *uhidDevice) read() (uhidEvent, error) {
-	buf := make([]byte, uhidEventSize)
-	n, err := d.f.Read(buf)
+	buf := make([]byte, 66)
+	n, err := d.conn.Read(buf)
 	if err != nil {
 		return uhidEvent{}, err
 	}
-	if n < 4 {
-		return uhidEvent{}, fmt.Errorf("short uhid event: %d bytes", n)
+	if n != 1 && n != 65 {
+		return uhidEvent{}, fmt.Errorf("invalid UHID service message length %d", n)
 	}
-	ev := uhidEvent{kind: binary.LittleEndian.Uint32(buf[0:])}
-
-	// uhid_output_req lays out data BEFORE size, unlike input2. Getting this
-	// backwards is the classic way to lose an afternoon here.
-	if ev.kind == uhidOutput {
-		const (
-			outOffData  = 4
-			outOffSize  = 4100
-			outOffRtype = 4102
-		)
-		if n < outOffRtype+1 {
-			return uhidEvent{}, fmt.Errorf("truncated UHID_OUTPUT: %d bytes", n)
+	kind := uint32(buf[0])
+	switch kind {
+	case uhidOutput:
+		if n != 65 {
+			return uhidEvent{}, fmt.Errorf("invalid FIDO output")
 		}
-		size := int(binary.LittleEndian.Uint16(buf[outOffSize:]))
-		if size > outOffSize-outOffData {
-			return uhidEvent{}, fmt.Errorf("implausible output size %d", size)
+	case uhidStart, uhidStop, uhidOpen, uhidClose:
+		if n != 1 {
+			return uhidEvent{}, fmt.Errorf("invalid lifecycle message")
 		}
-		data := make([]byte, size)
-		copy(data, buf[outOffData:outOffData+size])
-		// hidraw strips a leading report number of 0, but tolerate it anyway.
-		if len(data) == 65 && data[0] == 0 {
-			data = data[1:]
-		}
-		ev.data = data
+	default:
+		return uhidEvent{}, fmt.Errorf("invalid UHID service event %d", kind)
 	}
-	return ev, nil
+	return uhidEvent{kind: kind, data: buf[1:n]}, nil
 }
