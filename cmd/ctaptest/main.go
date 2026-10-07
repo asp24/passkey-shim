@@ -248,7 +248,7 @@ func main() {
 	}
 	f, err := os.OpenFile(flag.Arg(0), os.O_RDWR, 0)
 	if err != nil {
-		fmt.Printf("FAIL  cannot open %s: %v\n", os.Args[1], err)
+		fmt.Printf("FAIL  cannot open %s: %v\n", flag.Arg(0), err)
 		os.Exit(1)
 	}
 	defer f.Close()
@@ -408,8 +408,13 @@ func main() {
 	if !bytes.Equal(assert.RPIDHash, wantHash[:]) {
 		fail("getAssertion: rpIdHash mismatch")
 	}
+	// The user entity is optional in a getAssertion response.
+	userName := "(omitted)"
+	if gaResp.User != nil {
+		userName = gaResp.User.Name
+	}
 	pass("getAssertion        credential matched, counter=%d, user=%q",
-		assert.SignCount, gaResp.User.Name)
+		assert.SignCount, userName)
 
 	// --- the test that decides everything ---------------------------------
 	// A relying party verifies exactly this: ECDSA over SHA-256 of authData
@@ -451,9 +456,12 @@ func main() {
 	gaReq.AllowList = nil
 	otherBody, _ := enc.Marshal(gaReq)
 	st, _, err = c.cbor(0x02, otherBody)
-	if err == nil && st == 0x2E {
+	switch {
+	case err != nil:
+		fail("unknown RP: %v", err)
+	case st == 0x2E:
 		pass("unknown RP          correctly returned NO_CREDENTIALS (0x2e)")
-	} else {
+	default:
 		fail("unknown RP returned status 0x%02x, expected 0x2e", st)
 	}
 
