@@ -9,14 +9,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 
+	"go.uber.org/zap"
+
 	"llavero/internal/hidbridge"
 	"llavero/internal/hidbridge/kernel"
+	"llavero/internal/logging"
 )
 
 func main() {
@@ -29,25 +31,32 @@ func main() {
 	if os.Geteuid() != 0 {
 		fatal("must run as root")
 	}
+	log := logging.New(false).Named("broker").With(zap.Uint64("uid", uid))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	if err := serve(ctx, int(uid)); err != nil {
-		fatal(err)
+	err = serve(ctx, int(uid), log)
+	stop()
+	if err != nil {
+		log.Error("broker stopped", zap.Error(err))
+		_ = log.Sync()
+		os.Exit(1)
 	}
+	log.Info("broker stopped")
+	_ = log.Sync()
 }
 
 // serve runs until ctx is cancelled; the deferred Close unlinks the socket.
-func serve(ctx context.Context, uid int) error {
+func serve(ctx context.Context, uid int, log *zap.Logger) error {
 	// systemd creates the root-owned runtime directory.
 	listener, err := hidbridge.Listen(hidbridge.SocketPath(uid), uid)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
+	log.Info("listening", zap.String("socket", hidbridge.SocketPath(uid)))
 	srv := &hidbridge.Server{
 		UID:       uid,
 		NewDevice: func() (hidbridge.Device, error) { return kernel.Open(hidbridge.DeviceUniq(uid)) },
-		Logf:      log.New(os.Stdout, "", 0).Printf,
+		Logger:    log,
 	}
 	return srv.Serve(ctx, listener)
 }

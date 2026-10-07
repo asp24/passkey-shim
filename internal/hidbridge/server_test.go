@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/zap/zaptest"
 )
 
 const testTimeout = 2 * time.Second
@@ -59,7 +61,7 @@ func startServer(t *testing.T, newDevice func() (Device, error)) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{UID: os.Getuid(), NewDevice: newDevice, Logf: t.Logf}
+	srv := &Server{UID: os.Getuid(), NewDevice: newDevice, Logger: zaptest.NewLogger(t)}
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()

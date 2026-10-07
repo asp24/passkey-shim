@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"sync"
+
+	"go.uber.org/zap"
 )
 
 // Device is the HID device a broker session drives. Read must return an error
@@ -24,8 +26,9 @@ type Server struct {
 	UID int
 	// NewDevice creates the HID device once the client asks for it.
 	NewDevice func() (Device, error)
-	// Logf reports sessions that end abnormally. Nil discards them.
-	Logf func(format string, args ...any)
+	// Logger records rejected clients and sessions that end abnormally. Nil
+	// discards them.
+	Logger *zap.Logger
 }
 
 // Listen creates the broker socket at path, reachable only by uid. It never
@@ -51,6 +54,10 @@ func Listen(path string, uid int) (*net.UnixListener, error) {
 // from other users, and any connection while a session is active, are
 // dropped. On return the listener is closed and no session is left running.
 func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
+	log := s.Logger
+	if log == nil {
+		log = zap.NewNop()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	var sessions sync.WaitGroup
 	defer sessions.Wait()
@@ -68,11 +75,18 @@ func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
 			return fmt.Errorf("accepting client: %w", err)
 		}
 		peer, err := PeerUID(conn)
-		if err != nil || peer != uint32(s.UID) {
+		if err != nil {
+			log.Warn("rejected client: unknown credentials", zap.Error(err))
+			conn.Close()
+			continue
+		}
+		if peer != uint32(s.UID) {
+			log.Warn("rejected client from another user", zap.Uint32("uid", peer))
 			conn.Close()
 			continue
 		}
 		if !active.TryLock() {
+			log.Info("rejected second client while a session is active")
 			conn.Close()
 			continue
 		}
@@ -82,16 +96,17 @@ func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
 			stopConn := context.AfterFunc(ctx, func() { conn.Close() })
 			defer stopConn()
 			// A client closing its socket is the normal way a session ends.
-			if err := s.relay(conn); err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil {
-				s.logf("client disconnected: %v", err)
+			log.Info("client connected")
+			err := s.relay(conn)
+			switch {
+			case ctx.Err() != nil:
+				log.Info("session closed for shutdown")
+			case err == nil || errors.Is(err, io.EOF):
+				log.Info("client disconnected")
+			default:
+				log.Warn("session ended abnormally", zap.Error(err))
 			}
 		})
-	}
-}
-
-func (s *Server) logf(format string, args ...any) {
-	if s.Logf != nil {
-		s.Logf(format, args...)
 	}
 }
 
