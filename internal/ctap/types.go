@@ -1,4 +1,4 @@
-package main
+package ctap
 
 // CTAP2 request and response shapes. CTAP2 uses integer map keys throughout,
 // hence keyasint on every field. Nested entity maps (rp, user, credential
@@ -36,12 +36,14 @@ const (
 	algES256 = -7
 )
 
-type rpEntity struct {
+// RPEntity is the relying party a credential belongs to.
+type RPEntity struct {
 	ID   string `cbor:"id"`
 	Name string `cbor:"name,omitempty"`
 }
 
-type userEntity struct {
+// UserEntity is the account a credential belongs to. ID is an opaque handle.
+type UserEntity struct {
 	ID          []byte `cbor:"id"`
 	Name        string `cbor:"name,omitempty"`
 	DisplayName string `cbor:"displayName,omitempty"`
@@ -59,8 +61,8 @@ type credentialDescriptor struct {
 
 type makeCredentialRequest struct {
 	ClientDataHash   []byte                 `cbor:"1,keyasint"`
-	RP               rpEntity               `cbor:"2,keyasint"`
-	User             userEntity             `cbor:"3,keyasint"`
+	RP               RPEntity               `cbor:"2,keyasint"`
+	User             UserEntity             `cbor:"3,keyasint"`
 	PubKeyCredParams []pubKeyCredParam      `cbor:"4,keyasint"`
 	ExcludeList      []credentialDescriptor `cbor:"5,keyasint,omitempty"`
 	Extensions       map[string]any         `cbor:"6,keyasint,omitempty"`
@@ -89,7 +91,7 @@ type getAssertionResponse struct {
 	Credential          credentialDescriptor `cbor:"1,keyasint"`
 	AuthData            []byte               `cbor:"2,keyasint"`
 	Signature           []byte               `cbor:"3,keyasint"`
-	User                *userEntity          `cbor:"4,keyasint,omitempty"`
+	User                *UserEntity          `cbor:"4,keyasint,omitempty"`
 	NumberOfCredentials int                  `cbor:"5,keyasint,omitempty"`
 }
 

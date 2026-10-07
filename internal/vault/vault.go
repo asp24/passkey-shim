@@ -600,16 +600,3 @@ func (v *Vault) Count() int {
 	defer v.mu.Unlock()
 	return len(v.contents.Credentials)
 }
-
-// ParsePrivateKey decodes a stored PKCS#8 ECDSA key.
-func ParsePrivateKey(pkcs8 []byte) (*ecdsa.PrivateKey, error) {
-	k, err := x509.ParsePKCS8PrivateKey(pkcs8)
-	if err != nil {
-		return nil, err
-	}
-	priv, ok := k.(*ecdsa.PrivateKey)
-	if !ok {
-		return nil, errors.New("stored key is not ECDSA")
-	}
-	return priv, nil
-}

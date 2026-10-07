@@ -1,61 +1,130 @@
-package main
-
-// The CTAP2 command handlers. This is the layer that turns a decoded request
-// into a signed credential or assertion.
+// Package ctap implements the CTAP2 authenticator: the command handlers that
+// turn a decoded request into a signed credential or assertion, and the
+// consent and user verification that guard them.
+package ctap
 
 import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
-
-	"llavero/internal/vault"
 )
 
-type approver interface {
+// Credential is a stored passkey as the authenticator needs it.
+type Credential struct {
+	ID          []byte
+	UserID      []byte
+	UserName    string
+	UserDisplay string
+	PrivateKey  []byte // PKCS#8
+}
+
+// Store holds the passkeys. Every mutating method persists before returning.
+type Store interface {
+	// HasCredentialFor reports whether any of the excluded IDs belongs to rpID.
+	HasCredentialFor(rpID string, exclude [][]byte) bool
+	// AddCredential mints and stores a P-256 key for the account, replacing
+	// any earlier credential for the same rp and user.
+	AddCredential(rp RPEntity, user UserEntity) (id []byte, priv *ecdsa.PrivateKey, err error)
+	// FindForRP returns the credentials for rpID, newest first, restricted to
+	// allow when it is not empty.
+	FindForRP(rpID string, allow [][]byte) []Credential
+	// BumpSignCount increments and returns the credential's counter.
+	BumpSignCount(id []byte) (uint32, error)
+}
+
+// Approver asks the user to pick one of several choices.
+type Approver interface {
 	// Confirm blocks until the user decides. An empty choice denies the
 	// operation; an error means we could not ask at all, which also denies.
 	Confirm(title string, choices []string) (string, error)
 }
 
-// userVerifier is the biometric check. Verify returns false on a genuine
+// UserVerifier is the biometric check. Verify returns false on a genuine
 // non-match and an error only when the check could not run at all.
-type userVerifier interface {
+type UserVerifier interface {
 	Verify(reason string) (bool, error)
 }
 
-type authenticator struct {
-	vault    *vault.Vault
-	approver approver
-	verifier userVerifier // nil when biometric UV is off
-	strictUV bool         // if set, a broken sensor denies instead of falling back
-	// fingerprintConsent drops the click-to-approve menu and treats the
-	// fingerprint touch as both consent and verification, the way Touch ID and
-	// Windows Hello do. The notification names the site before the scan, so
-	// the user still sees what they are approving.
-	fingerprintConsent bool
-	// uvGrace lets a second request for the SAME site reuse a scan that just
+// Notifier tells the user what just happened.
+type Notifier interface {
+	Notify(summary, body string)
+}
+
+// Config wires an Authenticator to its dependencies.
+type Config struct {
+	Store    Store
+	Approver Approver
+	// Verifier is nil when biometric user verification is off.
+	Verifier UserVerifier
+	Notifier Notifier
+	// StrictUV denies when the sensor is unusable instead of falling back to
+	// the approval the user already gave.
+	StrictUV bool
+	// FingerprintConsent drops the click-to-approve menu and treats the
+	// fingerprint touch as both consent and verification, the way Touch ID
+	// and Windows Hello do. The notification names the site before the scan,
+	// so the user still sees what they are approving.
+	FingerprintConsent bool
+	// UVGrace lets a second request for the SAME site reuse a scan that just
 	// succeeded. Clients routinely fire two getAssertion calls milliseconds
 	// apart, and asking for two touches to sign in once reads as a bug.
-	uvGrace time.Duration
-	aaguid  [16]byte
-	logf    func(string, ...any)
+	UVGrace time.Duration
+	// AAGUID identifies the authenticator model.
+	AAGUID [16]byte
+	Logf   func(format string, args ...any)
+}
+
+// Authenticator handles CTAP2 commands. Handle is safe to call from several
+// goroutines.
+type Authenticator struct {
+	store              Store
+	approver           Approver
+	verifier           UserVerifier
+	notifier           Notifier
+	strictUV           bool
+	fingerprintConsent bool
+	uvGrace            time.Duration
+	aaguid             [16]byte
+	logf               func(string, ...any)
 
 	graceMu   sync.Mutex
 	graceRP   string
 	graceTime time.Time
 }
 
+// New builds an Authenticator from cfg. Store, Approver and Notifier are
+// required.
+func New(cfg Config) *Authenticator {
+	logf := cfg.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	return &Authenticator{
+		store:              cfg.Store,
+		approver:           cfg.Approver,
+		verifier:           cfg.Verifier,
+		notifier:           cfg.Notifier,
+		strictUV:           cfg.StrictUV,
+		fingerprintConsent: cfg.FingerprintConsent,
+		uvGrace:            cfg.UVGrace,
+		aaguid:             cfg.AAGUID,
+		logf:               logf,
+	}
+}
+
 // recentlyVerified reports whether a successful scan for this exact site is
 // still inside the grace window. Scoping it to one site matters: a scan for
 // one login must never authorise a different one.
-func (a *authenticator) recentlyVerified(rpID string) bool {
+func (a *Authenticator) recentlyVerified(rpID string) bool {
 	if a.uvGrace <= 0 {
 		return false
 	}
@@ -64,7 +133,7 @@ func (a *authenticator) recentlyVerified(rpID string) bool {
 	return a.graceRP == rpID && time.Since(a.graceTime) < a.uvGrace
 }
 
-func (a *authenticator) markVerified(rpID string) {
+func (a *Authenticator) markVerified(rpID string) {
 	a.graceMu.Lock()
 	defer a.graceMu.Unlock()
 	a.graceRP, a.graceTime = rpID, time.Now()
@@ -74,14 +143,14 @@ func (a *authenticator) markVerified(rpID string) {
 // It is only safe when a sensor is actually available: with no verifier there
 // would be no user interaction at all, and a page could mint passkeys in
 // silence.
-func (a *authenticator) consentIsFingerprint() bool {
+func (a *Authenticator) consentIsFingerprint() bool {
 	return a.fingerprintConsent && a.verifier != nil
 }
 
 // requestConsent asks the user to approve an operation, returning false if they
 // declined or could not be asked. With fingerprint consent the touch is the
 // whole interaction; otherwise the menu runs first and the touch confirms it.
-func (a *authenticator) requestConsent(rpID, title, affirmative, reason string) bool {
+func (a *Authenticator) requestConsent(rpID, title, affirmative, reason string) bool {
 	if a.consentIsFingerprint() {
 		return a.verifyUserFor(rpID, reason)
 	}
@@ -97,8 +166,9 @@ func (a *authenticator) requestConsent(rpID, title, affirmative, reason string) 
 	return a.verifyUserFor(rpID, reason)
 }
 
-// verifyUser is the biometric half of user verification. Consent (the menu)
-// has already happened by the time this runs.
+// verifyUserFor is the biometric half of user verification. Consent (the
+// menu) has already happened by the time this runs. Naming a site lets a scan
+// for it be reused within the grace window.
 //
 // A sensor that cannot be used is treated differently from a finger that does
 // not match. A non-match denies, always. A hardware failure falls back to the
@@ -106,13 +176,7 @@ func (a *authenticator) requestConsent(rpID, title, affirmative, reason string) 
 // known to wedge after suspend, and a vault that locks you out of every
 // account until you reboot is a worse outcome than one that leans on the
 // prompt you already answered. Run with -uv-strict to invert that.
-func (a *authenticator) verifyUser(reason string) bool {
-	return a.verifyUserFor("", reason)
-}
-
-// verifyUserFor runs the biometric check, honouring the grace window when the
-// caller names a site.
-func (a *authenticator) verifyUserFor(rpID, reason string) bool {
+func (a *Authenticator) verifyUserFor(rpID, reason string) bool {
 	if a.verifier == nil {
 		return true
 	}
@@ -124,16 +188,16 @@ func (a *authenticator) verifyUserFor(rpID, reason string) bool {
 	if err != nil {
 		if a.strictUV {
 			a.logf("fingerprint unavailable (%v); denying because -uv-strict is set", err)
-			desktop.Notify("Fingerprint unavailable", "Request denied")
+			a.notifier.Notify("Fingerprint unavailable", "Request denied")
 			return false
 		}
 		a.logf("fingerprint unavailable (%v); accepting the desktop approval alone", err)
-		desktop.Notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
+		a.notifier.Notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
 		return true
 	}
 	if !ok {
 		a.logf("fingerprint did not match")
-		desktop.Notify("Fingerprint did not match", reason)
+		a.notifier.Notify("Fingerprint did not match", reason)
 		return false
 	}
 	if rpID != "" {
@@ -142,10 +206,10 @@ func (a *authenticator) verifyUserFor(rpID, reason string) bool {
 	return true
 }
 
-// handle decodes one CTAP2 message and returns the raw response, status byte
+// Handle decodes one CTAP2 message and returns the raw response, status byte
 // first. Every error path returns a CTAP status rather than a Go error,
 // because the transport has no other way to report failure.
-func (a *authenticator) handle(payload []byte) []byte {
+func (a *Authenticator) Handle(payload []byte) []byte {
 	if len(payload) == 0 {
 		return []byte{statusInvalidLength}
 	}
@@ -172,7 +236,7 @@ func (a *authenticator) handle(payload []byte) []byte {
 	}
 }
 
-func (a *authenticator) getInfo() []byte {
+func (a *Authenticator) getInfo() []byte {
 	info := authenticatorInfo{
 		Versions: []string{"FIDO_2_0"},
 		AAGUID:   a.aaguid[:],
@@ -192,7 +256,7 @@ func (a *authenticator) getInfo() []byte {
 	return append([]byte{statusOK}, body...)
 }
 
-func (a *authenticator) selection() []byte {
+func (a *Authenticator) selection() []byte {
 	choice, err := a.approver.Confirm("Use Llavero for this site?", []string{"Use it", "Cancel"})
 	if err != nil || choice != "Use it" {
 		return []byte{statusOperationDenied}
@@ -200,7 +264,7 @@ func (a *authenticator) selection() []byte {
 	return []byte{statusOK}
 }
 
-func (a *authenticator) makeCredential(body []byte) []byte {
+func (a *Authenticator) makeCredential(body []byte) []byte {
 	var req makeCredentialRequest
 	if err := ctapDecMode.Unmarshal(body, &req); err != nil {
 		a.logf("makeCredential: malformed request: %v", err)
@@ -231,7 +295,7 @@ func (a *authenticator) makeCredential(body []byte) []byte {
 	// excludeList is how an RP says "this user already has a key here". The
 	// spec wants user presence before we admit it, but a desktop prompt for a
 	// duplicate registration is noise, so we answer directly.
-	if a.vault.HasCredentialFor(req.RP.ID, descriptorIDs(req.ExcludeList)) {
+	if a.store.HasCredentialFor(req.RP.ID, descriptorIDs(req.ExcludeList)) {
 		a.logf("makeCredential: %s already has a credential in the exclude list", req.RP.ID)
 		return []byte{statusCredentialExcluded}
 	}
@@ -249,19 +313,13 @@ func (a *authenticator) makeCredential(body []byte) []byte {
 		return []byte{statusOperationDenied}
 	}
 
-	cred, priv, err := a.vault.AddCredential(vault.Account{
-		RPID:        req.RP.ID,
-		RPName:      req.RP.Name,
-		UserID:      req.User.ID,
-		UserName:    req.User.Name,
-		UserDisplay: req.User.DisplayName,
-	})
+	credID, priv, err := a.store.AddCredential(req.RP, req.User)
 	if err != nil {
 		a.logf("makeCredential: vault write failed: %v", err)
 		return []byte{statusOther}
 	}
 
-	attested, err := a.attestedCredentialData(cred.ID, priv)
+	attested, err := a.attestedCredentialData(credID, priv)
 	if err != nil {
 		a.logf("makeCredential: encoding public key failed: %v", err)
 		return []byte{statusOther}
@@ -283,12 +341,12 @@ func (a *authenticator) makeCredential(body []byte) []byte {
 		return []byte{statusOther}
 	}
 
-	a.logf("registered passkey for %s (%s), credential %x", req.RP.ID, label, cred.ID[:8])
-	desktop.Notify("Passkey created", fmt.Sprintf("%s (%s)", req.RP.ID, label))
+	a.logf("registered passkey for %s (%s), credential %x", req.RP.ID, label, credID[:8])
+	a.notifier.Notify("Passkey created", fmt.Sprintf("%s (%s)", req.RP.ID, label))
 	return append([]byte{statusOK}, out...)
 }
 
-func (a *authenticator) getAssertion(body []byte) []byte {
+func (a *Authenticator) getAssertion(body []byte) []byte {
 	var req getAssertionRequest
 	if err := ctapDecMode.Unmarshal(body, &req); err != nil {
 		a.logf("getAssertion: malformed request: %v", err)
@@ -298,7 +356,7 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 		return []byte{statusInvalidParameter}
 	}
 
-	matches := a.vault.FindForRP(req.RPID, descriptorIDs(req.AllowList))
+	matches := a.store.FindForRP(req.RPID, descriptorIDs(req.AllowList))
 	if len(matches) == 0 {
 		a.logf("getAssertion: no credential for %s", req.RPID)
 		return []byte{statusNoCredentials}
@@ -310,7 +368,7 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 	if len(matches) > 1 {
 		labels := make([]string, 0, len(matches))
 		for _, c := range matches {
-			labels = append(labels, displayName(userEntity{
+			labels = append(labels, displayName(UserEntity{
 				Name: c.UserName, DisplayName: c.UserDisplay,
 			}))
 		}
@@ -331,7 +389,7 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 			return []byte{statusOperationDenied}
 		}
 	} else {
-		label := displayName(userEntity{Name: chosen.UserName, DisplayName: chosen.UserDisplay})
+		label := displayName(UserEntity{Name: chosen.UserName, DisplayName: chosen.UserDisplay})
 		title := fmt.Sprintf("Sign in to %s?", req.RPID)
 		if label != "" {
 			title = fmt.Sprintf("Sign in to %s as %s?", req.RPID, label)
@@ -345,13 +403,13 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 		}
 	}
 
-	priv, err := vault.ParsePrivateKey(chosen.PrivateKey)
+	priv, err := parsePrivateKey(chosen.PrivateKey)
 	if err != nil {
 		a.logf("getAssertion: stored key unusable: %v", err)
 		return []byte{statusOther}
 	}
 
-	count, err := a.vault.BumpSignCount(chosen.ID)
+	count, err := a.store.BumpSignCount(chosen.ID)
 	if err != nil {
 		a.logf("getAssertion: could not persist sign count: %v", err)
 		return []byte{statusOther}
@@ -374,7 +432,7 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 		Credential: credentialDescriptor{Type: "public-key", ID: chosen.ID},
 		AuthData:   authData,
 		Signature:  sig,
-		User: &userEntity{
+		User: &UserEntity{
 			ID:          chosen.UserID,
 			Name:        chosen.UserName,
 			DisplayName: chosen.UserDisplay,
@@ -392,7 +450,7 @@ func (a *authenticator) getAssertion(body []byte) []byte {
 
 // attestedCredentialData builds the attestation block embedded in authData at
 // registration: aaguid, credential id, then the COSE public key.
-func (a *authenticator) attestedCredentialData(credID []byte, priv *ecdsa.PrivateKey) ([]byte, error) {
+func (a *Authenticator) attestedCredentialData(credID []byte, priv *ecdsa.PrivateKey) ([]byte, error) {
 	pub := priv.PublicKey
 	key := coseKey{
 		Kty: 2, // EC2
@@ -456,7 +514,7 @@ func supportsES256(params []pubKeyCredParam) bool {
 // displayName picks the friendliest label for an account. The user handle is
 // opaque binary per spec, so it is only used as a last resort and only when it
 // happens to be printable, rather than spraying control bytes into a menu.
-func displayName(u userEntity) string {
+func displayName(u UserEntity) string {
 	if u.Name != "" {
 		return u.Name
 	}
@@ -488,6 +546,18 @@ func descriptorIDs(list []credentialDescriptor) [][]byte {
 		ids = append(ids, d.ID)
 	}
 	return ids
+}
+
+func parsePrivateKey(pkcs8 []byte) (*ecdsa.PrivateKey, error) {
+	k, err := x509.ParsePKCS8PrivateKey(pkcs8)
+	if err != nil {
+		return nil, fmt.Errorf("parsing PKCS#8 key: %w", err)
+	}
+	priv, ok := k.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("stored key is not ECDSA")
+	}
+	return priv, nil
 }
 
 func indexOf(hay []string, needle string) int {

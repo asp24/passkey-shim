@@ -22,6 +22,7 @@ import (
 	"golang.org/x/term"
 
 	"llavero/internal/approval"
+	"llavero/internal/ctap"
 	"llavero/internal/fingerprint"
 	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
@@ -242,7 +243,7 @@ func run(opts options) error {
 		return err
 	}
 
-	var ap approver
+	var ap ctap.Approver
 	if opts.autoApprove {
 		logf("WARNING: -auto-approve is set. Every request will be granted without asking.")
 		ap = approval.Auto{}
@@ -256,7 +257,7 @@ func run(opts options) error {
 
 	// Keep this an interface and assign it only on success: a nil
 	// *fingerprint.Verifier stored here would compare non-nil.
-	var verifier userVerifier
+	var verifier ctap.UserVerifier
 	switch opts.uv {
 	case "fingerprint":
 		if opts.autoApprove {
@@ -295,16 +296,17 @@ func run(opts options) error {
 		logf("repeat requests from the same site within %s reuse the previous scan", opts.uvGrace)
 	}
 
-	auth := &authenticator{
-		vault:              v,
-		approver:           ap,
-		uvGrace:            opts.uvGrace,
-		verifier:           verifier,
-		strictUV:           opts.uvStrict,
-		fingerprintConsent: fingerprintConsent,
-		aaguid:             aaguid,
-		logf:               logf,
-	}
+	auth := ctap.New(ctap.Config{
+		Store:              vaultStore{v},
+		Approver:           ap,
+		Verifier:           verifier,
+		Notifier:           desktop,
+		StrictUV:           opts.uvStrict,
+		FingerprintConsent: fingerprintConsent,
+		UVGrace:            opts.uvGrace,
+		AAGUID:             aaguid,
+		Logf:               logf,
+	})
 
 	// Only now does the device appear, so browsers never see a key that
 	// cannot answer yet.
@@ -324,7 +326,7 @@ func run(opts options) error {
 
 	go reportNode()
 
-	stack := newCtapHID(dev, auth.handle, vlogf)
+	stack := newCtapHID(dev, auth.Handle, vlogf)
 
 	for {
 		ev, err := dev.Read()
