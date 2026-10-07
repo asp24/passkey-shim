@@ -1,5 +1,8 @@
 [Unit]
 Description=Llavero FIDO HID broker for UID %i
+# Let a uhid entry in /etc/modules-load.d/ take effect first; the broker
+# refuses to start without /dev/uhid.
+After=systemd-modules-load.service
 
 [Service]
 Type=simple

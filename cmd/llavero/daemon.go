@@ -46,7 +46,8 @@ func (a *app) run() error {
 			"details in: journalctl -u llavero-uhid@%d", err, os.Getuid())
 	}
 	if err != nil {
-		return fmt.Errorf("UHID service: %w (enable llavero-uhid@%d.service)", err, os.Getuid())
+		return fmt.Errorf("UHID service: %w (is llavero-uhid@%d.service enabled? check: systemctl status llavero-uhid@%d)",
+			err, os.Getuid(), os.Getuid())
 	}
 	defer dev.Close()
 

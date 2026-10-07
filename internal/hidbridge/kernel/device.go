@@ -28,6 +28,16 @@ func Open(uniq string) (*Device, error) {
 	return &Device{dev: dev, uniq: uniq}, nil
 }
 
+// Check reports whether /dev/uhid can be opened at all, so the broker can
+// refuse to start on a machine where no session could ever succeed.
+func Check() error {
+	dev, err := uhid.Open()
+	if err != nil {
+		return err
+	}
+	return dev.Close()
+}
+
 // Create registers the device with the kernel, which makes it visible to
 // browsers.
 func (d *Device) Create() error {

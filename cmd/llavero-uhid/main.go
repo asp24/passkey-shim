@@ -33,7 +33,7 @@ func main() {
 	}
 	log := logging.New(false).Named("broker").With(zap.Uint64("uid", uid))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	err = serve(ctx, int(uid), log)
+	err = serve(ctx, int(uid), log, kernel.Check)
 	stop()
 	if err != nil {
 		log.Error("broker stopped", zap.Error(err))
@@ -45,7 +45,12 @@ func main() {
 }
 
 // serve runs until ctx is cancelled; the deferred Close unlinks the socket.
-func serve(ctx context.Context, uid int, log *zap.Logger) error {
+// checkDevice runs before the socket exists: a broker that cannot open
+// /dev/uhid fails its unit instead of accepting clients it cannot serve.
+func serve(ctx context.Context, uid int, log *zap.Logger, checkDevice func() error) error {
+	if err := checkDevice(); err != nil {
+		return fmt.Errorf("refusing to start: %w", err)
+	}
 	// systemd creates the root-owned runtime directory.
 	listener, err := hidbridge.Listen(hidbridge.SocketPath(uid), uid)
 	if err != nil {
