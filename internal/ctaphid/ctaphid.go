@@ -8,6 +8,7 @@
 package ctaphid
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -70,14 +71,14 @@ type Transport struct {
 	dev     ReportSender
 	pending map[uint32]*assembly
 	nextCID uint32
-	onCBOR  func(payload []byte) []byte
+	onCBOR  func(ctx context.Context, payload []byte) []byte
 	log     *zap.Logger
 }
 
 // New returns a Transport that answers through dev and passes each CTAP2
 // message to onCBOR, whose return value is sent back as the response. Frames
 // are logged at debug level, transport faults at warn.
-func New(dev ReportSender, onCBOR func([]byte) []byte, log *zap.Logger) *Transport {
+func New(dev ReportSender, onCBOR func(context.Context, []byte) []byte, log *zap.Logger) *Transport {
 	return &Transport{
 		dev:     dev,
 		pending: make(map[uint32]*assembly),
@@ -87,8 +88,9 @@ func New(dev ReportSender, onCBOR func([]byte) []byte, log *zap.Logger) *Transpo
 	}
 }
 
-// HandlePacket consumes one 64-byte host-to-device packet.
-func (c *Transport) HandlePacket(p []byte) {
+// HandlePacket consumes one 64-byte host-to-device packet. CTAP2 requests run
+// under ctx.
+func (c *Transport) HandlePacket(ctx context.Context, p []byte) {
 	if len(p) < 5 {
 		c.log.Debug("ignoring runt packet", zap.Int("bytes", len(p)))
 		return
@@ -127,7 +129,7 @@ func (c *Transport) HandlePacket(p []byte) {
 		}
 		a.payload = append(a.payload, p[7:7+n]...)
 		if len(a.payload) >= bcnt {
-			c.dispatch(cid, a)
+			c.dispatch(ctx, cid, a)
 			return
 		}
 		c.pending[cid] = a
@@ -156,7 +158,7 @@ func (c *Transport) HandlePacket(p []byte) {
 	a.payload = append(a.payload, p[5:5+n]...)
 	if len(a.payload) >= a.total {
 		delete(c.pending, cid)
-		c.dispatch(cid, a)
+		c.dispatch(ctx, cid, a)
 	}
 }
 
@@ -182,7 +184,7 @@ func (c *Transport) handleInit(cid uint32, nonce []byte) {
 	c.sendMessage(cid, cmdInit, resp)
 }
 
-func (c *Transport) dispatch(cid uint32, a *assembly) {
+func (c *Transport) dispatch(ctx context.Context, cid uint32, a *assembly) {
 	switch a.cmd {
 	case cmdPing:
 		c.log.Debug("CTAPHID_PING", cidField(cid), zap.Int("bytes", len(a.payload)))
@@ -194,7 +196,7 @@ func (c *Transport) dispatch(cid uint32, a *assembly) {
 		}
 		c.log.Debug("CTAPHID_CBOR", cidField(cid),
 			zap.String("command", describeCBORCommand(a.payload[0])), zap.Int("bytes", len(a.payload)))
-		c.runWithKeepalive(cid, a.payload)
+		c.runWithKeepalive(ctx, cid, a.payload)
 	case cmdWink:
 		c.log.Debug("CTAPHID_WINK", cidField(cid))
 		c.sendMessage(cid, cmdWink, nil)
@@ -215,9 +217,9 @@ func (c *Transport) dispatch(cid uint32, a *assembly) {
 //
 // Note this blocks the read loop, so CTAPHID_CANCEL is not honoured mid-prompt;
 // the host times out instead. Acceptable while there is one dialog at a time.
-func (c *Transport) runWithKeepalive(cid uint32, payload []byte) {
+func (c *Transport) runWithKeepalive(ctx context.Context, cid uint32, payload []byte) {
 	done := make(chan []byte, 1)
-	go func() { done <- c.onCBOR(payload) }()
+	go func() { done <- c.onCBOR(ctx, payload) }()
 
 	ticker := time.NewTicker(keepaliveInterval)
 	defer ticker.Stop()

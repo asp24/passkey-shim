@@ -42,17 +42,21 @@ func NewMenu() (*Menu, error) {
 
 // Confirm shows title with choices and blocks until the user picks one. An
 // empty choice means the user dismissed the prompt; an error means the prompt
-// could not be shown at all.
-func (m *Menu) Confirm(title string, choices []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), approvalTimeout)
+// could not be shown at all, timed out, or ctx was cancelled. Cancelling ctx
+// kills the picker, so the dialog disappears with the request.
+func (m *Menu) Confirm(ctx context.Context, title string, choices []string) (string, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, approvalTimeout)
 	defer cancel()
 
 	args := append([]string{title}, choices...)
-	cmd := exec.CommandContext(ctx, m.binary, args...)
+	cmd := exec.CommandContext(waitCtx, m.binary, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
-	if ctx.Err() == context.DeadlineExceeded {
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("approval prompt cancelled: %w", ctx.Err())
+	}
+	if waitCtx.Err() != nil {
 		return "", errors.New("timed out waiting for approval")
 	}
 	if err != nil {
@@ -82,6 +86,6 @@ func (m *Menu) Confirm(title string, choices []string) (string, error) {
 type Auto struct{}
 
 // Confirm returns the first choice without asking anyone.
-func (Auto) Confirm(title string, choices []string) (string, error) {
+func (Auto) Confirm(_ context.Context, title string, choices []string) (string, error) {
 	return choices[0], nil
 }

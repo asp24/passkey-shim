@@ -6,6 +6,7 @@
 package fingerprint
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/user"
@@ -86,9 +87,10 @@ func defaultDevice(conn *dbus.Conn) (dbus.ObjectPath, error) {
 }
 
 // Verify runs one scan. It returns (true, nil) on a match, (false, nil) on a
-// genuine non-match, and an error wrapping ErrUnavailable only when the sensor
-// could not be used.
-func (fv *Verifier) Verify(reason string) (bool, error) {
+// genuine non-match, an error wrapping ErrUnavailable when the sensor could
+// not be used, and ctx's error if ctx is done first. The sensor is released
+// and the prompt dismissed in every case.
+func (fv *Verifier) Verify(ctx context.Context, reason string) (bool, error) {
 	conn, err := dbus.SystemBus()
 	if err != nil {
 		return false, fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -136,6 +138,9 @@ func (fv *Verifier) Verify(reason string) (bool, error) {
 	deadline := time.After(fingerprintTimeout)
 	for {
 		select {
+		case <-ctx.Done():
+			return false, fmt.Errorf("fingerprint scan cancelled: %w", ctx.Err())
+
 		case <-deadline:
 			return false, fmt.Errorf("%w: no response from the sensor in %s",
 				ErrUnavailable, fingerprintTimeout)

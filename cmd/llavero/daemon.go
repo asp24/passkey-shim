@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -132,6 +133,9 @@ func (a *app) run() error {
 
 	go a.reportNode()
 
+	// Requests run under the daemon's lifetime; replaced by a signal-bound
+	// context once shutdown stops calling os.Exit.
+	ctx := context.Background()
 	stack := ctaphid.New(dev, auth.Handle, a.log.Named("ctaphid"))
 
 	for {
@@ -149,7 +153,7 @@ func (a *app) run() error {
 		case hidbridge.EventStop:
 			a.log.Debug("device stopped")
 		case hidbridge.EventOutput:
-			stack.HandlePacket(ev.Data)
+			stack.HandlePacket(ctx, ev.Data)
 		default:
 			a.log.Debug("unhandled device event", zap.Uint8("kind", ev.Kind))
 		}

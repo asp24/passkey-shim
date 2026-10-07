@@ -2,6 +2,7 @@ package ctap
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
+	"time"
 
 	"go.uber.org/zap/zaptest"
 )
@@ -93,7 +95,7 @@ type fakeApprover struct {
 	err     error
 }
 
-func (f fakeApprover) Confirm(_ string, choices []string) (string, error) {
+func (f fakeApprover) Confirm(_ context.Context, _ string, choices []string) (string, error) {
 	if f.err != nil {
 		return "", f.err
 	}
@@ -109,7 +111,7 @@ type fakeVerifier struct {
 	calls int
 }
 
-func (f *fakeVerifier) Verify(string) (bool, error) {
+func (f *fakeVerifier) Verify(context.Context, string) (bool, error) {
 	f.calls++
 	return f.match, f.err
 }
@@ -168,7 +170,7 @@ func signRequest(rpID string) getAssertionRequest {
 // parsed out of the attested authData.
 func register(t *testing.T, a *Authenticator, rpID string) ([]byte, *ecdsa.PublicKey) {
 	t.Helper()
-	resp := a.Handle(command(t, ctapMakeCredential, registerRequest(rpID)))
+	resp := a.Handle(context.Background(), command(t, ctapMakeCredential, registerRequest(rpID)))
 	if resp[0] != statusOK {
 		t.Fatalf("makeCredential status 0x%02x", resp[0])
 	}
@@ -207,7 +209,7 @@ func TestRegisterThenSignVerifies(t *testing.T) {
 
 	for wantCount := uint32(1); wantCount <= 2; wantCount++ {
 		req := signRequest("example.test")
-		resp := a.Handle(command(t, ctapGetAssertion, req))
+		resp := a.Handle(context.Background(), command(t, ctapGetAssertion, req))
 		if resp[0] != statusOK {
 			t.Fatalf("getAssertion status 0x%02x", resp[0])
 		}
@@ -266,7 +268,7 @@ func TestMakeCredentialRefusals(t *testing.T) {
 			}
 			before := len(store.creds)
 			a := newTestAuthenticator(t, store, tt.approver, nil)
-			resp := a.Handle(command(t, ctapMakeCredential, req))
+			resp := a.Handle(context.Background(), command(t, ctapMakeCredential, req))
 			if resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
 			}
@@ -292,7 +294,7 @@ func TestGetAssertionRefusals(t *testing.T) {
 			store := &memStore{}
 			register(t, newTestAuthenticator(t, store, fakeApprover{}, nil), "example.test")
 			a := newTestAuthenticator(t, store, tt.approver, nil)
-			resp := a.Handle(command(t, ctapGetAssertion, signRequest(tt.rpID)))
+			resp := a.Handle(context.Background(), command(t, ctapGetAssertion, signRequest(tt.rpID)))
 			if resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
 			}
@@ -318,7 +320,7 @@ func TestMalformedRequests(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if resp := a.Handle(tt.payload); resp[0] != tt.want {
+			if resp := a.Handle(context.Background(), tt.payload); resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
 			}
 		})
@@ -343,7 +345,7 @@ func TestUserVerificationOutcomes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			uv := &fakeVerifier{match: tt.match, err: tt.err}
 			a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, uv, func(c *Config) { c.StrictUV = tt.strict })
-			resp := a.Handle(command(t, ctapMakeCredential, registerRequest("example.test")))
+			resp := a.Handle(context.Background(), command(t, ctapMakeCredential, registerRequest("example.test")))
 			if resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
 			}
@@ -362,7 +364,7 @@ func TestGraceWindowIsPerSite(t *testing.T) {
 	uv := &fakeVerifier{match: true}
 	a := newTestAuthenticator(t, store, fakeApprover{}, uv, func(c *Config) { c.UVGrace = 1 << 40 })
 	for _, rpID := range []string{"example.test", "example.test", "other.test"} {
-		if resp := a.Handle(command(t, ctapGetAssertion, signRequest(rpID))); resp[0] != statusOK {
+		if resp := a.Handle(context.Background(), command(t, ctapGetAssertion, signRequest(rpID))); resp[0] != statusOK {
 			t.Fatalf("%s: status 0x%02x", rpID, resp[0])
 		}
 	}
@@ -374,7 +376,7 @@ func TestGraceWindowIsPerSite(t *testing.T) {
 // Fingerprint consent must not silently approve when no sensor exists.
 func TestFingerprintConsentNeedsVerifier(t *testing.T) {
 	a := newTestAuthenticator(t, &memStore{}, fakeApprover{decline: true}, nil, func(c *Config) { c.FingerprintConsent = true })
-	resp := a.Handle(command(t, ctapMakeCredential, registerRequest("example.test")))
+	resp := a.Handle(context.Background(), command(t, ctapMakeCredential, registerRequest("example.test")))
 	if resp[0] != statusOperationDenied {
 		t.Fatalf("status 0x%02x; consent was skipped without a sensor", resp[0])
 	}
@@ -382,7 +384,7 @@ func TestFingerprintConsentNeedsVerifier(t *testing.T) {
 
 func TestGetInfoAdvertisesPasskeys(t *testing.T) {
 	a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, nil)
-	resp := a.Handle([]byte{ctapGetInfo})
+	resp := a.Handle(context.Background(), []byte{ctapGetInfo})
 	if resp[0] != statusOK {
 		t.Fatalf("status 0x%02x", resp[0])
 	}
@@ -430,4 +432,105 @@ func TestCOSEKeyKeepsLeadingZeros(t *testing.T) {
 		return
 	}
 	t.Fatal("no key with a leading zero coordinate in 10000 tries")
+}
+
+// waitingApprover blocks until the request is cancelled, like a prompt the
+// user never answers.
+type waitingApprover struct{}
+
+func (waitingApprover) Confirm(ctx context.Context, _ string, _ []string) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+// lateApprover approves, but only after the host has already cancelled.
+type lateApprover struct{ cancel context.CancelFunc }
+
+func (l lateApprover) Confirm(_ context.Context, _ string, choices []string) (string, error) {
+	l.cancel()
+	return choices[0], nil
+}
+
+// waitingVerifier blocks until the request is cancelled, like a sensor
+// nobody touches, and reports the cancellation as its error.
+type waitingVerifier struct{}
+
+func (waitingVerifier) Verify(ctx context.Context, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// A request the host cancels must end with KEEPALIVE_CANCEL and change
+// nothing, wherever it was waiting.
+func TestHostCancellation(t *testing.T) {
+	tests := []struct {
+		name     string
+		cmd      byte
+		approver func(cancel context.CancelFunc) Approver
+		verifier UserVerifier
+		strictUV bool
+	}{
+		{"register: approval prompt open", ctapMakeCredential,
+			func(context.CancelFunc) Approver { return waitingApprover{} }, nil, false},
+		{"register: approved after the host gave up", ctapMakeCredential,
+			func(c context.CancelFunc) Approver { return lateApprover{c} }, nil, false},
+		// The lenient fallback treats a broken sensor as approval; a cancelled
+		// scan must not be mistaken for one.
+		{"register: fingerprint scan, lenient", ctapMakeCredential,
+			func(context.CancelFunc) Approver { return fakeApprover{} }, waitingVerifier{}, false},
+		{"register: fingerprint scan, strict", ctapMakeCredential,
+			func(context.CancelFunc) Approver { return fakeApprover{} }, waitingVerifier{}, true},
+		{"sign in: approval prompt open", ctapGetAssertion,
+			func(context.CancelFunc) Approver { return waitingApprover{} }, nil, false},
+		{"sign in: fingerprint scan, lenient", ctapGetAssertion,
+			func(context.CancelFunc) Approver { return fakeApprover{} }, waitingVerifier{}, false},
+		{"selection prompt open", ctapSelection,
+			func(context.CancelFunc) Approver { return waitingApprover{} }, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &memStore{}
+			register(t, newTestAuthenticator(t, store, fakeApprover{}, nil), "example.test")
+			before := len(store.creds)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			var uv UserVerifier
+			if tt.verifier != nil {
+				uv = tt.verifier
+			}
+			a := newTestAuthenticator(t, store, tt.approver(cancel), uv, func(c *Config) { c.StrictUV = tt.strictUV })
+
+			var payload []byte
+			switch tt.cmd {
+			case ctapMakeCredential:
+				req := registerRequest("example.test")
+				req.User.ID = []byte("user-2") // a new account, so nothing is excluded
+				payload = command(t, ctapMakeCredential, req)
+			case ctapGetAssertion:
+				payload = command(t, ctapGetAssertion, signRequest("example.test"))
+			default:
+				payload = []byte{tt.cmd}
+			}
+
+			resp := a.Handle(ctx, payload)
+			if resp[0] != statusKeepaliveCancel {
+				t.Fatalf("status 0x%02x, want KEEPALIVE_CANCEL", resp[0])
+			}
+			if len(store.creds) != before {
+				t.Fatal("a cancelled registration was stored")
+			}
+			if store.creds[0].signCount != 0 {
+				t.Fatal("a cancelled assertion advanced the sign counter")
+			}
+		})
+	}
+}
+
+// A user who declines is still reported as a denial, not a cancellation.
+func TestDeclineIsNotCancel(t *testing.T) {
+	a := newTestAuthenticator(t, &memStore{}, fakeApprover{decline: true}, nil)
+	if resp := a.Handle(context.Background(), command(t, ctapMakeCredential, registerRequest("example.test"))); resp[0] != statusOperationDenied {
+		t.Fatalf("status 0x%02x, want OPERATION_DENIED", resp[0])
+	}
 }

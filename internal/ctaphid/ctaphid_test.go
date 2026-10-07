@@ -2,6 +2,7 @@ package ctaphid
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"sync"
 	"testing"
@@ -69,10 +70,10 @@ func packets(cid uint32, cmd byte, payload []byte) [][]byte {
 	return out
 }
 
-func newTestTransport(onCBOR func([]byte) []byte) (*Transport, *recorder) {
+func newTestTransport(onCBOR func(context.Context, []byte) []byte) (*Transport, *recorder) {
 	rec := &recorder{}
 	if onCBOR == nil {
-		onCBOR = func([]byte) []byte { return nil }
+		onCBOR = func(context.Context, []byte) []byte { return nil }
 	}
 	return New(rec, onCBOR, zap.NewNop()), rec
 }
@@ -80,7 +81,7 @@ func newTestTransport(onCBOR func([]byte) []byte) (*Transport, *recorder) {
 func TestInitAllocatesChannel(t *testing.T) {
 	tr, rec := newTestTransport(nil)
 	nonce := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	tr.HandlePacket(packets(broadcastCID, cmdInit, nonce)[0])
+	tr.HandlePacket(context.Background(), packets(broadcastCID, cmdInit, nonce)[0])
 
 	cid, cmd, resp := rec.message(t)
 	if cid != broadcastCID || cmd != cmdInit {
@@ -104,7 +105,7 @@ func TestPingRoundTripsFragmentedPayloads(t *testing.T) {
 		tr, rec := newTestTransport(nil)
 		payload := bytes.Repeat([]byte{0xa5}, size)
 		for _, p := range packets(7, cmdPing, payload) {
-			tr.HandlePacket(p)
+			tr.HandlePacket(context.Background(), p)
 		}
 		cid, cmd, resp := rec.message(t)
 		if cid != 7 || cmd != cmdPing || !bytes.Equal(resp, payload) {
@@ -115,13 +116,13 @@ func TestPingRoundTripsFragmentedPayloads(t *testing.T) {
 
 func TestCBORReachesHandler(t *testing.T) {
 	var got []byte
-	tr, rec := newTestTransport(func(p []byte) []byte {
+	tr, rec := newTestTransport(func(_ context.Context, p []byte) []byte {
 		got = append([]byte(nil), p...)
 		return []byte{0x00, 0xaa}
 	})
 	request := append([]byte{0x04}, bytes.Repeat([]byte{0x11}, 100)...)
 	for _, p := range packets(9, cmdCBOR, request) {
-		tr.HandlePacket(p)
+		tr.HandlePacket(context.Background(), p)
 	}
 	if !bytes.Equal(got, request) {
 		t.Fatalf("handler got %d bytes, want %d", len(got), len(request))
@@ -153,7 +154,7 @@ func TestErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tr, rec := newTestTransport(nil)
 			for _, p := range tt.packets {
-				tr.HandlePacket(p)
+				tr.HandlePacket(context.Background(), p)
 			}
 			_, cmd, resp := rec.message(t)
 			if cmd != cmdError || len(resp) != 1 || resp[0] != tt.want {
@@ -165,11 +166,11 @@ func TestErrors(t *testing.T) {
 
 func TestRuntAndStrayPacketsAreIgnored(t *testing.T) {
 	tr, rec := newTestTransport(nil)
-	tr.HandlePacket([]byte{1, 2, 3})
+	tr.HandlePacket(context.Background(), []byte{1, 2, 3})
 	stray := make([]byte, packetSize)
 	binary.BigEndian.PutUint32(stray[0:4], 5)
 	stray[4] = 0 // continuation on an idle channel
-	tr.HandlePacket(stray)
+	tr.HandlePacket(context.Background(), stray)
 	if len(rec.packets) != 0 {
 		t.Fatalf("sent %d packets in reply to garbage", len(rec.packets))
 	}

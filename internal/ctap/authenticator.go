@@ -4,6 +4,7 @@
 package ctap
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
@@ -46,15 +47,17 @@ type Store interface {
 
 // Approver asks the user to pick one of several choices.
 type Approver interface {
-	// Confirm blocks until the user decides. An empty choice denies the
-	// operation; an error means we could not ask at all, which also denies.
-	Confirm(title string, choices []string) (string, error)
+	// Confirm blocks until the user decides or ctx is done. An empty choice
+	// denies the operation; an error means we could not ask at all, which
+	// also denies. The prompt must be gone from the screen when it returns.
+	Confirm(ctx context.Context, title string, choices []string) (string, error)
 }
 
 // UserVerifier is the biometric check. Verify returns false on a genuine
-// non-match and an error only when the check could not run at all.
+// non-match and an error when the check could not run at all, including when
+// ctx was cancelled first.
 type UserVerifier interface {
-	Verify(reason string) (bool, error)
+	Verify(ctx context.Context, reason string) (bool, error)
 }
 
 // Notifier tells the user what just happened.
@@ -151,14 +154,28 @@ func (a *Authenticator) consentIsFingerprint() bool {
 	return a.fingerprintConsent && a.verifier != nil
 }
 
-// requestConsent asks the user to approve an operation, returning false if they
-// declined or could not be asked. With fingerprint consent the touch is the
-// whole interaction; otherwise the menu runs first and the touch confirms it.
-func (a *Authenticator) requestConsent(rpID, title, affirmative, reason string) bool {
-	if a.consentIsFingerprint() {
-		return a.verifyUserFor(rpID, reason)
+// denied is the status for a refused operation: KEEPALIVE_CANCEL when the
+// host cancelled the request while we waited, OPERATION_DENIED otherwise.
+func denied(ctx context.Context) []byte {
+	if ctx.Err() != nil {
+		return []byte{statusKeepaliveCancel}
 	}
-	choice, err := a.approver.Confirm(title, []string{affirmative, "Cancel"})
+	return []byte{statusOperationDenied}
+}
+
+// requestConsent asks the user to approve an operation, returning false if they
+// declined, could not be asked, or the host cancelled. With fingerprint
+// consent the touch is the whole interaction; otherwise the menu runs first
+// and the touch confirms it.
+func (a *Authenticator) requestConsent(ctx context.Context, rpID, title, affirmative, reason string) bool {
+	if a.consentIsFingerprint() {
+		return a.verifyUserFor(ctx, rpID, reason)
+	}
+	choice, err := a.approver.Confirm(ctx, title, []string{affirmative, "Cancel"})
+	if ctx.Err() != nil {
+		a.log.Info("cancelled by the host while asking for approval", zap.String("reason", reason))
+		return false
+	}
 	if err != nil {
 		a.log.Warn("could not ask for approval", zap.String("reason", reason), zap.Error(err))
 		return false
@@ -167,7 +184,7 @@ func (a *Authenticator) requestConsent(rpID, title, affirmative, reason string) 
 		a.log.Info("declined by user", zap.String("reason", reason))
 		return false
 	}
-	return a.verifyUserFor(rpID, reason)
+	return a.verifyUserFor(ctx, rpID, reason)
 }
 
 // verifyUserFor is the biometric half of user verification. Consent (the
@@ -180,7 +197,13 @@ func (a *Authenticator) requestConsent(rpID, title, affirmative, reason string) 
 // known to wedge after suspend, and a vault that locks you out of every
 // account until you reboot is a worse outcome than one that leans on the
 // prompt you already answered. Run with -uv-strict to invert that.
-func (a *Authenticator) verifyUserFor(rpID, reason string) bool {
+//
+// A cancelled request is never mistaken for a broken sensor: the lenient
+// fallback would otherwise approve a request the host already abandoned.
+func (a *Authenticator) verifyUserFor(ctx context.Context, rpID, reason string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	if a.verifier == nil {
 		return true
 	}
@@ -188,7 +211,11 @@ func (a *Authenticator) verifyUserFor(rpID, reason string) bool {
 		a.log.Info("reusing the scan from moments ago", zap.String("rp", rpID))
 		return true
 	}
-	ok, err := a.verifier.Verify(reason)
+	ok, err := a.verifier.Verify(ctx, reason)
+	if ctx.Err() != nil {
+		a.log.Info("cancelled by the host during the fingerprint scan", zap.String("reason", reason))
+		return false
+	}
 	if err != nil {
 		if a.strictUV {
 			a.log.Warn("fingerprint unavailable; denying because strict verification is on", zap.Error(err))
@@ -212,8 +239,9 @@ func (a *Authenticator) verifyUserFor(rpID, reason string) bool {
 
 // Handle decodes one CTAP2 message and returns the raw response, status byte
 // first. Every error path returns a CTAP status rather than a Go error,
-// because the transport has no other way to report failure.
-func (a *Authenticator) Handle(payload []byte) []byte {
+// because the transport has no other way to report failure. Cancelling ctx
+// closes any prompt and answers KEEPALIVE_CANCEL.
+func (a *Authenticator) Handle(ctx context.Context, payload []byte) []byte {
 	if len(payload) == 0 {
 		return []byte{statusInvalidLength}
 	}
@@ -223,12 +251,12 @@ func (a *Authenticator) Handle(payload []byte) []byte {
 	case ctapGetInfo:
 		return a.getInfo()
 	case ctapMakeCredential:
-		return a.makeCredential(body)
+		return a.makeCredential(ctx, body)
 	case ctapGetAssertion:
-		return a.getAssertion(body)
+		return a.getAssertion(ctx, body)
 	case ctapSelection:
 		// Used by browsers to ask "is this the key the user wants to use?".
-		return a.selection()
+		return a.selection(ctx)
 	case ctapReset:
 		// Wiping every passkey on an unauthenticated USB command is not a
 		// trade we want, so this stays refused.
@@ -260,15 +288,15 @@ func (a *Authenticator) getInfo() []byte {
 	return append([]byte{statusOK}, body...)
 }
 
-func (a *Authenticator) selection() []byte {
-	choice, err := a.approver.Confirm("Use Llavero for this site?", []string{"Use it", "Cancel"})
+func (a *Authenticator) selection(ctx context.Context) []byte {
+	choice, err := a.approver.Confirm(ctx, "Use Llavero for this site?", []string{"Use it", "Cancel"})
 	if err != nil || choice != "Use it" {
-		return []byte{statusOperationDenied}
+		return denied(ctx)
 	}
 	return []byte{statusOK}
 }
 
-func (a *Authenticator) makeCredential(body []byte) []byte {
+func (a *Authenticator) makeCredential(ctx context.Context, body []byte) []byte {
 	var req makeCredentialRequest
 	if err := ctapDecMode.Unmarshal(body, &req); err != nil {
 		a.log.Info("makeCredential: malformed request", zap.Error(err))
@@ -313,8 +341,13 @@ func (a *Authenticator) makeCredential(body []byte) []byte {
 	if label != "" {
 		reason = fmt.Sprintf("Create a passkey for %s as %s", req.RP.ID, label)
 	}
-	if !a.requestConsent(req.RP.ID, title, "Create passkey", reason) {
-		return []byte{statusOperationDenied}
+	if !a.requestConsent(ctx, req.RP.ID, title, "Create passkey", reason) {
+		return denied(ctx)
+	}
+	// The host may have given up while the user was approving. Storing the
+	// key then would leave a passkey the relying party never received.
+	if ctx.Err() != nil {
+		return denied(ctx)
 	}
 
 	credID, priv, err := a.store.AddCredential(req.RP, req.User)
@@ -351,7 +384,7 @@ func (a *Authenticator) makeCredential(body []byte) []byte {
 	return append([]byte{statusOK}, out...)
 }
 
-func (a *Authenticator) getAssertion(body []byte) []byte {
+func (a *Authenticator) getAssertion(ctx context.Context, body []byte) []byte {
 	var req getAssertionRequest
 	if err := ctapDecMode.Unmarshal(body, &req); err != nil {
 		a.log.Info("getAssertion: malformed request", zap.Error(err))
@@ -377,21 +410,21 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 				Name: c.UserName, DisplayName: c.UserDisplay,
 			}))
 		}
-		choice, err := a.approver.Confirm(
+		choice, err := a.approver.Confirm(ctx,
 			fmt.Sprintf("Sign in to %s as:", req.RPID), labels)
 		if err != nil || choice == "" {
 			a.log.Info("getAssertion: account choice declined or timed out", zap.String("rp", req.RPID), zap.Error(err))
-			return []byte{statusOperationDenied}
+			return denied(ctx)
 		}
 		idx := indexOf(labels, choice)
 		if idx < 0 {
-			return []byte{statusOperationDenied}
+			return denied(ctx)
 		}
 		chosen = matches[idx]
 		// Choosing an account is itself the consent, so only verification is
 		// left to do.
-		if !a.verifyUserFor(req.RPID, fmt.Sprintf("Sign in to %s as %s", req.RPID, labels[idx])) {
-			return []byte{statusOperationDenied}
+		if !a.verifyUserFor(ctx, req.RPID, fmt.Sprintf("Sign in to %s as %s", req.RPID, labels[idx])) {
+			return denied(ctx)
 		}
 	} else {
 		label := displayName(UserEntity{Name: chosen.UserName, DisplayName: chosen.UserDisplay})
@@ -403,8 +436,8 @@ func (a *Authenticator) getAssertion(body []byte) []byte {
 		if label != "" {
 			reason = fmt.Sprintf("Sign in to %s as %s", req.RPID, label)
 		}
-		if !a.requestConsent(req.RPID, title, "Sign in", reason) {
-			return []byte{statusOperationDenied}
+		if !a.requestConsent(ctx, req.RPID, title, "Sign in", reason) {
+			return denied(ctx)
 		}
 	}
 

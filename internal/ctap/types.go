@@ -26,6 +26,7 @@ const (
 	statusUserActionTimeout  = 0x2F
 	statusNotAllowed         = 0x30
 	statusUnsupportedOption  = 0x2B
+	statusKeepaliveCancel    = 0x2D // the host cancelled while we waited for the user
 	statusOther              = 0x7F
 
 	// authData flag bits.
