@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -37,10 +38,11 @@ const (
 	capCBOR = 0x04 // speaks CTAP2
 	capNMSG = 0x08 // does NOT speak legacy U2F (CTAPHID_MSG)
 
-	errInvalidCmd = 0x01
-	errInvalidLen = 0x03
-	errInvalidSeq = 0x04
-	errOther      = 0x7F
+	errInvalidCmd  = 0x01
+	errInvalidLen  = 0x03
+	errInvalidSeq  = 0x04
+	errChannelBusy = 0x06
+	errOther       = 0x7F
 
 	// KEEPALIVE status bytes.
 	statusProcessing = 0x01
@@ -64,15 +66,35 @@ type ReportSender interface {
 	SendInput(report []byte) error
 }
 
+// request is the CTAP2 command currently being handled.
+type request struct {
+	cid    uint32
+	cancel context.CancelFunc
+}
+
 // Transport reassembles host packets into CTAPHID messages, answers the
 // transport-level commands itself and hands CTAP2 payloads to a handler.
-// HandlePacket must be called from one goroutine.
+//
+// HandlePacket must be called from one goroutine. A CTAP2 request runs in the
+// background, so the reader keeps seeing packets while the user is being
+// asked: CTAPHID_CANCEL or INIT on the request's channel cancels it, and any
+// other CTAP2 request meanwhile gets ERR_CHANNEL_BUSY. Call Wait after the
+// last HandlePacket to let a running request finish.
 type Transport struct {
 	dev     ReportSender
-	pending map[uint32]*assembly
-	nextCID uint32
 	onCBOR  func(ctx context.Context, payload []byte) []byte
 	log     *zap.Logger
+	pending map[uint32]*assembly // reader goroutine only
+	nextCID uint32               // reader goroutine only
+
+	// sendMu keeps the packets of one message together; keepalives and
+	// responses come from the request goroutine, everything else from the
+	// reader.
+	sendMu sync.Mutex
+
+	mu       sync.Mutex
+	active   *request
+	requests sync.WaitGroup
 }
 
 // New returns a Transport that answers through dev and passes each CTAP2
@@ -109,12 +131,18 @@ func (c *Transport) HandlePacket(ctx context.Context, p []byte) {
 		bcnt := int(binary.BigEndian.Uint16(p[5:7]))
 
 		if cmd == cmdInit {
-			delete(c.pending, cid) // INIT aborts any transaction on this channel
+			// INIT aborts any transaction on this channel, including a
+			// request waiting for the user.
+			delete(c.pending, cid)
+			c.cancelRequest(cid)
 			c.handleInit(cid, p[7:7+8])
 			return
 		}
 		if cmd == cmdCancel {
 			delete(c.pending, cid)
+			if c.cancelRequest(cid) {
+				c.log.Debug("CTAPHID_CANCEL", cidField(cid))
+			}
 			return
 		}
 		if bcnt > 7609 { // spec maximum message size
@@ -196,7 +224,10 @@ func (c *Transport) dispatch(ctx context.Context, cid uint32, a *assembly) {
 		}
 		c.log.Debug("CTAPHID_CBOR", cidField(cid),
 			zap.String("command", describeCBORCommand(a.payload[0])), zap.Int("bytes", len(a.payload)))
-		c.runWithKeepalive(ctx, cid, a.payload)
+		if !c.startRequest(ctx, cid, a.payload) {
+			c.log.Debug("busy with another request", cidField(cid))
+			c.sendError(cid, errChannelBusy)
+		}
 	case cmdWink:
 		c.log.Debug("CTAPHID_WINK", cidField(cid))
 		c.sendMessage(cid, cmdWink, nil)
@@ -210,14 +241,50 @@ func (c *Transport) dispatch(ctx context.Context, cid uint32, a *assembly) {
 	}
 }
 
+// Wait blocks until the request in flight, if any, has sent its response.
+func (c *Transport) Wait() { c.requests.Wait() }
+
+// startRequest runs a CTAP2 request in the background under its own context,
+// unless one is already running. Only one prompt can be on screen at a time,
+// so a second request is refused rather than queued.
+func (c *Transport) startRequest(ctx context.Context, cid uint32, payload []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.active != nil {
+		return false
+	}
+	reqCtx, cancel := context.WithCancel(ctx)
+	c.active = &request{cid: cid, cancel: cancel}
+	c.requests.Go(func() {
+		resp := c.runWithKeepalive(reqCtx, cid, payload)
+		// Free the transport before answering, so a host that sends its next
+		// request the moment this response lands is not told we are busy.
+		c.mu.Lock()
+		c.active = nil
+		c.mu.Unlock()
+		cancel()
+		c.sendMessage(cid, cmdCBOR, resp)
+	})
+	return true
+}
+
+// cancelRequest cancels the running request if it belongs to cid. The handler
+// then answers KEEPALIVE_CANCEL, which goes out as the request's response.
+func (c *Transport) cancelRequest(cid uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.active == nil || c.active.cid != cid {
+		return false
+	}
+	c.active.cancel()
+	return true
+}
+
 // runWithKeepalive executes a CTAP2 command while trickling KEEPALIVE frames
 // back to the host. Commands here block on a desktop approval dialog for as
 // long as the user takes, and without these frames the browser abandons the
 // request after about a second.
-//
-// Note this blocks the read loop, so CTAPHID_CANCEL is not honoured mid-prompt;
-// the host times out instead. Acceptable while there is one dialog at a time.
-func (c *Transport) runWithKeepalive(ctx context.Context, cid uint32, payload []byte) {
+func (c *Transport) runWithKeepalive(ctx context.Context, cid uint32, payload []byte) []byte {
 	done := make(chan []byte, 1)
 	go func() { done <- c.onCBOR(ctx, payload) }()
 
@@ -226,8 +293,7 @@ func (c *Transport) runWithKeepalive(ctx context.Context, cid uint32, payload []
 	for {
 		select {
 		case resp := <-done:
-			c.sendMessage(cid, cmdCBOR, resp)
-			return
+			return resp
 		case <-ticker.C:
 			c.sendKeepalive(cid, statusUPNeeded)
 		}
@@ -240,6 +306,8 @@ func (c *Transport) sendKeepalive(cid uint32, status byte) {
 	pkt[4] = cmdKeepalive | 0x80
 	binary.BigEndian.PutUint16(pkt[5:7], 1)
 	pkt[7] = status
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	if err := c.dev.SendInput(pkt); err != nil {
 		c.log.Warn("keepalive send failed", cidField(cid), zap.Error(err))
 	}
@@ -250,8 +318,11 @@ func (c *Transport) sendError(cid uint32, code byte) {
 }
 
 // sendMessage fragments a payload back to the host across as many packets as
-// it takes.
+// it takes, without letting another message interleave.
 func (c *Transport) sendMessage(cid uint32, cmd byte, payload []byte) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
 	pkt := make([]byte, packetSize)
 	binary.BigEndian.PutUint32(pkt[0:4], cid)
 	pkt[4] = cmd | 0x80

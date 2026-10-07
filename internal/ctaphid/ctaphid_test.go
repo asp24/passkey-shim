@@ -6,8 +6,9 @@ import (
 	"encoding/binary"
 	"sync"
 	"testing"
+	"time"
 
-	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 )
 
 // recorder captures every report the transport sends to the host.
@@ -70,16 +71,21 @@ func packets(cid uint32, cmd byte, payload []byte) [][]byte {
 	return out
 }
 
-func newTestTransport(onCBOR func(context.Context, []byte) []byte) (*Transport, *recorder) {
+// newTestTransport returns a transport that waits for its background request
+// when the test ends, so no handler outlives the test.
+func newTestTransport(t *testing.T, onCBOR func(context.Context, []byte) []byte) (*Transport, *recorder) {
+	t.Helper()
 	rec := &recorder{}
 	if onCBOR == nil {
 		onCBOR = func(context.Context, []byte) []byte { return nil }
 	}
-	return New(rec, onCBOR, zap.NewNop()), rec
+	tr := New(rec, onCBOR, zaptest.NewLogger(t))
+	t.Cleanup(tr.Wait)
+	return tr, rec
 }
 
 func TestInitAllocatesChannel(t *testing.T) {
-	tr, rec := newTestTransport(nil)
+	tr, rec := newTestTransport(t, nil)
 	nonce := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	tr.HandlePacket(context.Background(), packets(broadcastCID, cmdInit, nonce)[0])
 
@@ -102,7 +108,7 @@ func TestInitAllocatesChannel(t *testing.T) {
 // Payloads that span several packets in both directions must come back intact.
 func TestPingRoundTripsFragmentedPayloads(t *testing.T) {
 	for _, size := range []int{0, 1, initDataLen, initDataLen + 1, initDataLen + contDataLen + 1, 1000} {
-		tr, rec := newTestTransport(nil)
+		tr, rec := newTestTransport(t, nil)
 		payload := bytes.Repeat([]byte{0xa5}, size)
 		for _, p := range packets(7, cmdPing, payload) {
 			tr.HandlePacket(context.Background(), p)
@@ -116,7 +122,7 @@ func TestPingRoundTripsFragmentedPayloads(t *testing.T) {
 
 func TestCBORReachesHandler(t *testing.T) {
 	var got []byte
-	tr, rec := newTestTransport(func(_ context.Context, p []byte) []byte {
+	tr, rec := newTestTransport(t, func(_ context.Context, p []byte) []byte {
 		got = append([]byte(nil), p...)
 		return []byte{0x00, 0xaa}
 	})
@@ -124,6 +130,7 @@ func TestCBORReachesHandler(t *testing.T) {
 	for _, p := range packets(9, cmdCBOR, request) {
 		tr.HandlePacket(context.Background(), p)
 	}
+	tr.Wait()
 	if !bytes.Equal(got, request) {
 		t.Fatalf("handler got %d bytes, want %d", len(got), len(request))
 	}
@@ -152,7 +159,7 @@ func TestErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tr, rec := newTestTransport(nil)
+			tr, rec := newTestTransport(t, nil)
 			for _, p := range tt.packets {
 				tr.HandlePacket(context.Background(), p)
 			}
@@ -165,7 +172,7 @@ func TestErrors(t *testing.T) {
 }
 
 func TestRuntAndStrayPacketsAreIgnored(t *testing.T) {
-	tr, rec := newTestTransport(nil)
+	tr, rec := newTestTransport(t, nil)
 	tr.HandlePacket(context.Background(), []byte{1, 2, 3})
 	stray := make([]byte, packetSize)
 	binary.BigEndian.PutUint32(stray[0:4], 5)
@@ -173,5 +180,182 @@ func TestRuntAndStrayPacketsAreIgnored(t *testing.T) {
 	tr.HandlePacket(context.Background(), stray)
 	if len(rec.packets) != 0 {
 		t.Fatalf("sent %d packets in reply to garbage", len(rec.packets))
+	}
+}
+
+// blockingHandler stands in for a request waiting on the user. It reports
+// that it started, then answers KEEPALIVE_CANCEL once its context is done, or
+// OK once released.
+type blockingHandler struct {
+	started  chan struct{}
+	release  chan struct{}
+	canceled chan struct{}
+}
+
+func newBlockingHandler() *blockingHandler {
+	return &blockingHandler{
+		started:  make(chan struct{}, 4),
+		release:  make(chan struct{}),
+		canceled: make(chan struct{}, 4),
+	}
+}
+
+func (h *blockingHandler) handle(ctx context.Context, _ []byte) []byte {
+	h.started <- struct{}{}
+	select {
+	case <-ctx.Done():
+		h.canceled <- struct{}{}
+		return []byte{0x2d}
+	case <-h.release:
+		return []byte{0x00}
+	}
+}
+
+const waitTimeout = 2 * time.Second
+
+func startCBOR(t *testing.T, tr *Transport, ctx context.Context, cid uint32, h *blockingHandler) {
+	t.Helper()
+	for _, p := range packets(cid, cmdCBOR, []byte{0x02, 0xa0}) {
+		tr.HandlePacket(ctx, p)
+	}
+	select {
+	case <-h.started:
+	case <-time.After(waitTimeout):
+		t.Fatal("handler did not start")
+	}
+}
+
+func waitDone(t *testing.T, tr *Transport) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { tr.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(waitTimeout):
+		t.Fatal("request did not finish")
+	}
+}
+
+// cborResponse returns the payload of the CTAPHID_CBOR response sent on cid.
+func cborResponse(t *testing.T, rec *recorder, cid uint32) []byte {
+	t.Helper()
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, p := range rec.packets {
+		if binary.BigEndian.Uint32(p[0:4]) == cid && p[4] == cmdCBOR|0x80 {
+			n := int(binary.BigEndian.Uint16(p[5:7]))
+			return append([]byte(nil), p[7:7+n]...)
+		}
+	}
+	t.Fatalf("no CBOR response on channel %08x", cid)
+	return nil
+}
+
+// errorOn returns the CTAPHID_ERROR code sent on cid, or -1.
+func errorOn(rec *recorder, cid uint32) int {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, p := range rec.packets {
+		if binary.BigEndian.Uint32(p[0:4]) == cid && p[4] == cmdError|0x80 {
+			return int(p[7])
+		}
+	}
+	return -1
+}
+
+// CANCEL or INIT on the request's own channel must stop it promptly and send
+// the handler's answer as the response.
+func TestAbortStopsRequest(t *testing.T) {
+	tests := []struct {
+		name  string
+		abort []byte
+	}{
+		{"CTAPHID_CANCEL", packets(9, cmdCancel, nil)[0]},
+		{"CTAPHID_INIT resync", packets(9, cmdInit, bytes.Repeat([]byte{7}, 8))[0]},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newBlockingHandler()
+			tr, rec := newTestTransport(t, h.handle)
+			startCBOR(t, tr, context.Background(), 9, h)
+
+			tr.HandlePacket(context.Background(), tt.abort)
+			waitDone(t, tr)
+			select {
+			case <-h.canceled:
+			default:
+				t.Fatal("handler context was not cancelled")
+			}
+			if got := cborResponse(t, rec, 9); !bytes.Equal(got, []byte{0x2d}) {
+				t.Fatalf("response %x, want KEEPALIVE_CANCEL", got)
+			}
+		})
+	}
+}
+
+// Another channel cannot cancel a request it does not own.
+func TestCancelOnOtherChannelIsIgnored(t *testing.T) {
+	h := newBlockingHandler()
+	tr, rec := newTestTransport(t, h.handle)
+	startCBOR(t, tr, context.Background(), 9, h)
+
+	tr.HandlePacket(context.Background(), packets(10, cmdCancel, nil)[0])
+	select {
+	case <-h.canceled:
+		t.Fatal("CANCEL from another channel stopped the request")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(h.release)
+	waitDone(t, tr)
+	if got := cborResponse(t, rec, 9); !bytes.Equal(got, []byte{0x00}) {
+		t.Fatalf("response %x, want the handler's OK", got)
+	}
+}
+
+// While one request waits for the user, any other CTAP2 request is refused
+// rather than queued behind a prompt.
+func TestBusyWhileRequestRuns(t *testing.T) {
+	for _, cid := range []uint32{9, 10} {
+		h := newBlockingHandler()
+		tr, rec := newTestTransport(t, h.handle)
+		startCBOR(t, tr, context.Background(), 9, h)
+
+		for _, p := range packets(cid, cmdCBOR, []byte{0x02, 0xa0}) {
+			tr.HandlePacket(context.Background(), p)
+		}
+		if got := errorOn(rec, cid); got != errChannelBusy {
+			t.Fatalf("second request on %08x got error %d, want ERR_CHANNEL_BUSY", cid, got)
+		}
+		close(h.release)
+		waitDone(t, tr)
+	}
+}
+
+// Once a response is out, the next request must be accepted.
+func TestNotBusyAfterResponse(t *testing.T) {
+	h := newBlockingHandler()
+	close(h.release)
+	tr, rec := newTestTransport(t, h.handle)
+	for range 3 {
+		startCBOR(t, tr, context.Background(), 9, h)
+		waitDone(t, tr)
+	}
+	if got := errorOn(rec, 9); got != -1 {
+		t.Fatalf("sequential requests got error %d", got)
+	}
+}
+
+// Cancelling the transport's parent context ends the running request, which
+// is how the daemon shuts down with a prompt open.
+func TestParentContextCancelsRequest(t *testing.T) {
+	h := newBlockingHandler()
+	tr, rec := newTestTransport(t, h.handle)
+	ctx, cancel := context.WithCancel(context.Background())
+	startCBOR(t, tr, ctx, 9, h)
+
+	cancel()
+	waitDone(t, tr)
+	if got := cborResponse(t, rec, 9); !bytes.Equal(got, []byte{0x2d}) {
+		t.Fatalf("response %x, want KEEPALIVE_CANCEL", got)
 	}
 }
