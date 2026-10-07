@@ -28,6 +28,10 @@ const (
 	MaxEventSize = 1 + ReportSize
 )
 
+// DeviceUniq is the HID_UNIQ of the device the broker creates for uid, which
+// lets the client find its own hidraw node among other users' devices.
+func DeviceUniq(uid int) string { return fmt.Sprintf("llavero-%d", uid) }
+
 func SocketPath(uid int) string { return fmt.Sprintf("/run/llavero-uhid-%d/device.sock", uid) }
 
 func PeerUID(conn *net.UnixConn) (uint32, error) {

@@ -64,20 +64,20 @@ func serve(uid int) error {
 			defer active.Unlock()
 			defer conn.Close()
 			// A client closing its socket is the normal way a session ends.
-			if err := relay(conn); err != nil && !errors.Is(err, io.EOF) {
+			if err := relay(conn, uid); err != nil && !errors.Is(err, io.EOF) {
 				fmt.Printf("client disconnected: %v\n", err)
 			}
 		}()
 	}
 }
 
-func relay(conn *net.UnixConn) error {
+func relay(conn *net.UnixConn, uid int) error {
 	dev, err := uhid.Open()
 	if err != nil {
 		return err
 	}
 	defer dev.Close()
-	if err := dev.Create(); err != nil {
+	if err := dev.Create(hidbridge.DeviceUniq(uid)); err != nil {
 		return err
 	}
 	// A ready byte confirms device creation before the client unlocks its vault.

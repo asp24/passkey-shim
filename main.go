@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	"llavero/internal/hidbridge"
 )
 
 // aaguid identifies the authenticator model, not the user or the installation.
@@ -424,11 +426,12 @@ func zero(b []byte) {
 // actually reach it, which is the first thing to check if a browser cannot see
 // the key.
 func reportNode() {
+	uniq := hidbridge.DeviceUniq(os.Getuid())
 	time.Sleep(400 * time.Millisecond)
 	matches, _ := filepath.Glob("/sys/class/hidraw/hidraw*")
 	for _, m := range matches {
 		data, err := os.ReadFile(filepath.Join(m, "device", "uevent"))
-		if err != nil || !strings.Contains(string(data), "llavero") {
+		if err != nil || !strings.Contains("\n"+string(data), "\nHID_UNIQ="+uniq+"\n") {
 			continue
 		}
 		node := "/dev/" + filepath.Base(m)

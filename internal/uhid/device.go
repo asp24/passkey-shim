@@ -81,14 +81,15 @@ func Open() (*Device, error) {
 	return &Device{f: os.NewFile(uintptr(fd), "/dev/uhid")}, nil
 }
 
-// create registers the virtual device with the kernel, which materialises a
-// /dev/hidraw* node for it.
-func (d *Device) Create() error {
+// Create registers the virtual device with the kernel, which materialises a
+// /dev/hidraw* node for it. uniq becomes HID_UNIQ in the device's uevent and
+// must tell apart the devices of different users.
+func (d *Device) Create(uniq string) error {
 	ev := make([]byte, EventSize)
 	binary.LittleEndian.PutUint32(ev[0:], uhidCreate2)
 	copy(ev[offName:offName+127], "Llavero (virtual FIDO2)")
 	copy(ev[offPhys:offPhys+63], "llavero")
-	copy(ev[offUniq:offUniq+63], "llavero-0")
+	copy(ev[offUniq:offUniq+63], uniq)
 	binary.LittleEndian.PutUint16(ev[offRDSize:], uint16(len(fidoReportDescriptor)))
 	binary.LittleEndian.PutUint16(ev[offBus:], busUSB)
 	binary.LittleEndian.PutUint32(ev[offVendor:], 0x1209)  // pid.codes, open-source VID
