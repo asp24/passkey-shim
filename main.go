@@ -221,11 +221,11 @@ func run(opts options) error {
 
 	// Connect to the broker before asking for a passphrase, so a missing
 	// system service does not cost the user a typed secret first.
-	dev, err := openUHID()
+	dev, err := hidbridge.Dial(hidbridge.SocketPath(os.Getuid()), 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("UHID service: %w (enable llavero-uhid@%d.service)", err, os.Getuid())
 	}
-	defer dev.conn.Close()
+	defer dev.Close()
 
 	v, err := loadVault(opts)
 	if err != nil {
@@ -295,10 +295,10 @@ func run(opts options) error {
 
 	// Only now does the device appear, so browsers never see a key that
 	// cannot answer yet.
-	if err := dev.create(); err != nil {
+	if err := dev.Create(); err != nil {
 		return err
 	}
-	shutdown := func() { _ = dev.conn.Close() }
+	shutdown := func() { _ = dev.Close() }
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -314,23 +314,23 @@ func run(opts options) error {
 	stack := newCtapHID(dev, auth.handle, vlogf)
 
 	for {
-		ev, err := dev.read()
+		ev, err := dev.Read()
 		if err != nil {
-			return fmt.Errorf("reading from UHID service: %w", err)
+			return fmt.Errorf("UHID service: %w", err)
 		}
-		switch ev.kind {
-		case uhidStart:
+		switch ev.Kind {
+		case hidbridge.EventStart:
 			logf("authenticator is live, waiting for a browser")
-		case uhidOpen:
+		case hidbridge.EventOpen:
 			vlogf("device opened by a client")
-		case uhidClose:
+		case hidbridge.EventClose:
 			vlogf("device closed by a client")
-		case uhidStop:
+		case hidbridge.EventStop:
 			vlogf("UHID_STOP")
-		case uhidOutput:
-			stack.handlePacket(ev.data)
+		case hidbridge.EventOutput:
+			stack.handlePacket(ev.Data)
 		default:
-			vlogf("uhid event type %d", ev.kind)
+			vlogf("uhid event type %d", ev.Kind)
 		}
 	}
 }

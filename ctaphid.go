@@ -56,15 +56,20 @@ type assembly struct {
 	nextSeq byte
 }
 
+// reportSender delivers one 64-byte input report to the host.
+type reportSender interface {
+	SendInput(report []byte) error
+}
+
 type ctapHID struct {
-	dev     *uhidDevice
+	dev     reportSender
 	pending map[uint32]*assembly
 	nextCID uint32
 	onCBOR  func(payload []byte) []byte
 	logf    func(format string, args ...any)
 }
 
-func newCtapHID(dev *uhidDevice, onCBOR func([]byte) []byte, logf func(string, ...any)) *ctapHID {
+func newCtapHID(dev reportSender, onCBOR func([]byte) []byte, logf func(string, ...any)) *ctapHID {
 	return &ctapHID{
 		dev:     dev,
 		pending: make(map[uint32]*assembly),
@@ -224,7 +229,7 @@ func (c *ctapHID) sendKeepalive(cid uint32, status byte) {
 	pkt[4] = cmdKeepalive | 0x80
 	binary.BigEndian.PutUint16(pkt[5:7], 1)
 	pkt[7] = status
-	if err := c.dev.sendInput(pkt); err != nil {
+	if err := c.dev.SendInput(pkt); err != nil {
 		c.logf("keepalive send failed: %v", err)
 	}
 }
@@ -246,7 +251,7 @@ func (c *ctapHID) sendMessage(cid uint32, cmd byte, payload []byte) {
 		n = initDataLen
 	}
 	copy(pkt[7:], payload[:n])
-	if err := c.dev.sendInput(pkt); err != nil {
+	if err := c.dev.SendInput(pkt); err != nil {
 		c.logf("send failed: %v", err)
 		return
 	}
@@ -262,7 +267,7 @@ func (c *ctapHID) sendMessage(cid uint32, cmd byte, payload []byte) {
 			n = contDataLen
 		}
 		copy(cont[5:], payload[sent:sent+n])
-		if err := c.dev.sendInput(cont); err != nil {
+		if err := c.dev.SendInput(cont); err != nil {
 			c.logf("send failed: %v", err)
 			return
 		}
