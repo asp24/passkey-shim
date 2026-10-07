@@ -1,6 +1,4 @@
-package main
-
-// Process hardening applied before any key material exists.
+// Package hardening applies process protections before any key material exists.
 //
 // Two distinct exposures, with very different severity:
 //
@@ -14,20 +12,22 @@ package main
 // and recovered from it after power-off. If swap sits on an encrypted volume
 // that risk is already covered, which is the common case on a modern install,
 // so locking memory is defence in depth rather than the main event.
+package hardening
 
 import (
 	"fmt"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
-// hardenProcess is called before the vault is opened, so that no decrypted key
+// Apply is called before the vault is opened, so that no decrypted key
 // has ever existed in this process by the time the protections are in place.
 //
 // Nothing here is fatal. A machine that refuses one of these is still better
 // served by a working authenticator than by no authenticator, and the log says
 // exactly what did not apply.
-func hardenProcess(lockMemory bool, logf func(string, ...any)) {
+func Apply(lockMemory bool, logf func(string, ...any)) {
 	applied := noCoreDumps(logf)
 
 	if lockMemory {
@@ -37,7 +37,7 @@ func hardenProcess(lockMemory bool, logf func(string, ...any)) {
 	}
 
 	if len(applied) > 0 {
-		logf("hardening: %s", joinWith(applied, ", "))
+		logf("hardening: %s", strings.Join(applied, ", "))
 	}
 }
 
@@ -120,15 +120,4 @@ func describeLimit(v uint64) string {
 		return "unlimited"
 	}
 	return fmt.Sprintf("%d MiB", v/(1024*1024))
-}
-
-func joinWith(parts []string, sep string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += sep
-		}
-		out += p
-	}
-	return out
 }

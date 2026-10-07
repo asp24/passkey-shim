@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/term"
 
+	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
 )
 
@@ -207,7 +208,7 @@ func runRekey(opts options) error {
 func run(opts options) error {
 	// Before anything touches a key. Core dumps and ptrace are shut off first
 	// so there is no window in which a decrypted vault could escape.
-	hardenProcess(opts.mlock, logf)
+	hardening.Apply(opts.mlock, logf)
 
 	if opts.rekeyTo != "" {
 		return runRekey(opts)

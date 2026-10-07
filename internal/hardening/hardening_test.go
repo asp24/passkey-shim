@@ -1,4 +1,4 @@
-package main
+package hardening
 
 import (
 	"testing"
@@ -21,7 +21,7 @@ func TestHardeningDisablesCoreDumps(t *testing.T) {
 	}
 	t.Logf("RLIMIT_CORE before: cur=%d max=%d", before.Cur, before.Max)
 
-	hardenProcess(false, func(format string, args ...any) { t.Logf(format, args...) })
+	Apply(false, func(format string, args ...any) { t.Logf(format, args...) })
 
 	var after unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_CORE, &after); err != nil {
