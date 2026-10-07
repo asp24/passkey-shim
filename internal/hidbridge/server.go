@@ -12,9 +12,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// Device is the HID device a broker session drives. Read must return an error
-// once Close has been called, so a session can always be torn down.
+// Device is the HID device a broker session drives. It is opened when a client
+// connects but stays invisible to the host until Create. Read must return an
+// error once Close has been called, so a session can always be torn down.
 type Device interface {
+	Create() error
 	SendInput(report []byte) error
 	Read() (Event, error)
 	Close() error
@@ -24,8 +26,10 @@ type Device interface {
 type Server struct {
 	// UID is the only user allowed to connect.
 	UID int
-	// NewDevice creates the HID device once the client asks for it.
-	NewDevice func() (Device, error)
+	// OpenDevice prepares the HID device when a client connects, so a
+	// missing device is reported before the client asks for a passphrase.
+	// It must not make anything visible to the host; Create does that.
+	OpenDevice func() (Device, error)
 	// Logger records rejected clients and sessions that end abnormally. Nil
 	// discards them.
 	Logger *zap.Logger
@@ -111,6 +115,14 @@ func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
 }
 
 func (s *Server) relay(conn *net.UnixConn) error {
+	// Open the device up front, so a client on a machine where it cannot
+	// work hears so before it asks the user for a passphrase.
+	dev, err := s.OpenDevice()
+	if err != nil {
+		_, _ = conn.Write([]byte{Unavailable})
+		return fmt.Errorf("opening device: %w", err)
+	}
+	defer dev.Close()
 	if _, err := conn.Write([]byte{Accepted}); err != nil {
 		return fmt.Errorf("accepting client: %w", err)
 	}
@@ -119,11 +131,9 @@ func (s *Server) relay(conn *net.UnixConn) error {
 	if err := awaitCreate(conn); err != nil {
 		return err
 	}
-	dev, err := s.NewDevice()
-	if err != nil {
+	if err := dev.Create(); err != nil {
 		return fmt.Errorf("creating device: %w", err)
 	}
-	defer dev.Close()
 	// A ready byte confirms device creation, so the client fails loudly if the
 	// kernel refused it.
 	if _, err := conn.Write([]byte{Ready}); err != nil {

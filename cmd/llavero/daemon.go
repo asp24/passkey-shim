@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -40,6 +41,10 @@ func (a *app) run() error {
 	// Connect to the broker before asking for a passphrase, so a missing
 	// system service does not cost the user a typed secret first.
 	dev, err := hidbridge.Dial(hidbridge.SocketPath(os.Getuid()), 0)
+	if errors.Is(err, hidbridge.ErrUnavailable) {
+		return fmt.Errorf("UHID service: %w; load the uhid kernel module (sudo modprobe uhid), "+
+			"details in: journalctl -u llavero-uhid@%d", err, os.Getuid())
+	}
 	if err != nil {
 		return fmt.Errorf("UHID service: %w (enable llavero-uhid@%d.service)", err, os.Getuid())
 	}

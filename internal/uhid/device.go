@@ -8,6 +8,7 @@ package uhid
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 
@@ -70,12 +71,18 @@ var fidoReportDescriptor = []byte{
 	0xC0, //             End Collection
 }
 
+// Device is an open /dev/uhid file. Opening it creates nothing; the HID
+// device appears only after Create.
 type Device struct {
 	f *os.File
 }
 
+// Open opens /dev/uhid. It needs root.
 func Open() (*Device, error) {
 	fd, err := unix.Open("/dev/uhid", unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("open /dev/uhid: %w (load the uhid kernel module: sudo modprobe uhid)", err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/uhid (needs root): %w", err)
 	}

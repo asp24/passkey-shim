@@ -1,6 +1,7 @@
 package hidbridge
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -8,6 +9,11 @@ import (
 
 // replyTimeout bounds how long the client waits for a broker control byte.
 const replyTimeout = 5 * time.Second
+
+// ErrUnavailable means the broker is running but cannot open /dev/uhid, most
+// often because the uhid kernel module is not loaded. Its journal has the
+// cause.
+var ErrUnavailable = errors.New("broker cannot open /dev/uhid")
 
 // Client is the daemon's end of the broker socket. It exchanges FIDO reports
 // with the broker and never touches /dev/uhid itself.
@@ -30,9 +36,17 @@ func Dial(path string, brokerUID uint32) (*Client, error) {
 		return nil, fmt.Errorf("broker at %s runs as uid %d, not %d; refusing to talk to it", path, uid, brokerUID)
 	}
 	c := &Client{conn: conn}
-	if err := c.expect(Accepted); err != nil {
+	reply, err := c.readControl()
+	switch {
+	case err != nil:
 		conn.Close()
 		return nil, fmt.Errorf("broker refused the connection (is another llavero running?): %w", err)
+	case reply == Unavailable:
+		conn.Close()
+		return nil, ErrUnavailable
+	case reply != Accepted:
+		conn.Close()
+		return nil, fmt.Errorf("broker sent unexpected reply %d to a new connection", reply)
 	}
 	return c, nil
 }
@@ -73,21 +87,34 @@ func (c *Client) Read() (Event, error) {
 // Close disconnects, which makes the broker destroy the device.
 func (c *Client) Close() error { return c.conn.Close() }
 
-// expect reads one control byte from the broker, waiting at most replyTimeout.
+// expect reads one control byte from the broker and checks it is want.
 func (c *Client) expect(want byte) error {
+	got, err := c.readControl()
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("unexpected reply %d, want %d", got, want)
+	}
+	return nil
+}
+
+// readControl reads one control byte from the broker, waiting at most
+// replyTimeout.
+func (c *Client) readControl() (byte, error) {
 	if err := c.conn.SetReadDeadline(time.Now().Add(replyTimeout)); err != nil {
-		return fmt.Errorf("setting deadline: %w", err)
+		return 0, fmt.Errorf("setting deadline: %w", err)
 	}
 	buf := make([]byte, 2)
 	n, err := c.conn.Read(buf)
 	if err != nil {
-		return fmt.Errorf("reading reply: %w", err)
+		return 0, fmt.Errorf("reading reply: %w", err)
 	}
-	if n != 1 || buf[0] != want {
-		return fmt.Errorf("unexpected %d-byte reply starting with %d", n, buf[0])
+	if n != 1 {
+		return 0, fmt.Errorf("unexpected %d-byte control message", n)
 	}
 	if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
-		return fmt.Errorf("clearing deadline: %w", err)
+		return 0, fmt.Errorf("clearing deadline: %w", err)
 	}
-	return nil
+	return buf[0], nil
 }

@@ -54,9 +54,9 @@ func serve(ctx context.Context, uid int, log *zap.Logger) error {
 	defer listener.Close()
 	log.Info("listening", zap.String("socket", hidbridge.SocketPath(uid)))
 	srv := &hidbridge.Server{
-		UID:       uid,
-		NewDevice: func() (hidbridge.Device, error) { return kernel.Open(hidbridge.DeviceUniq(uid)) },
-		Logger:    log,
+		UID:        uid,
+		OpenDevice: func() (hidbridge.Device, error) { return kernel.Open(hidbridge.DeviceUniq(uid)) },
+		Logger:     log,
 	}
 	return srv.Serve(ctx, listener)
 }

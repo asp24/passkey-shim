@@ -23,6 +23,8 @@ const testTimeout = 2 * time.Second
 // fakeDevice stands in for /dev/uhid: the test feeds it host events and
 // inspects the reports the client sent.
 type fakeDevice struct {
+	createErr error
+	created   chan struct{}
 	events    chan Event
 	inputs    chan []byte
 	closed    chan struct{}
@@ -31,10 +33,19 @@ type fakeDevice struct {
 
 func newFakeDevice() *fakeDevice {
 	return &fakeDevice{
-		events: make(chan Event),
-		inputs: make(chan []byte, 8),
-		closed: make(chan struct{}),
+		created: make(chan struct{}, 1),
+		events:  make(chan Event),
+		inputs:  make(chan []byte, 8),
+		closed:  make(chan struct{}),
 	}
+}
+
+func (d *fakeDevice) Create() error {
+	if d.createErr != nil {
+		return d.createErr
+	}
+	d.created <- struct{}{}
+	return nil
 }
 
 func (d *fakeDevice) SendInput(report []byte) error {
@@ -57,14 +68,14 @@ func (d *fakeDevice) Close() error {
 }
 
 // startServer runs a broker for the current user on a temporary socket.
-func startServer(t *testing.T, newDevice func() (Device, error)) string {
+func startServer(t *testing.T, openDevice func() (Device, error)) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "device.sock")
 	listener, err := Listen(path, os.Getuid())
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{UID: os.Getuid(), NewDevice: newDevice, Logger: zaptest.NewLogger(t)}
+	srv := &Server{UID: os.Getuid(), OpenDevice: openDevice, Logger: zaptest.NewLogger(t)}
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()
@@ -141,7 +152,7 @@ func TestCancelEndsActiveSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{UID: os.Getuid(), NewDevice: func() (Device, error) { return dev, nil }}
+	srv := &Server{UID: os.Getuid(), OpenDevice: func() (Device, error) { return dev, nil }}
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()
@@ -169,21 +180,41 @@ func TestCancelEndsActiveSession(t *testing.T) {
 }
 
 func TestNoDeviceBeforeCreate(t *testing.T) {
-	created := make(chan struct{}, 1)
+	dev := newFakeDevice()
+	opened := make(chan struct{}, 1)
 	path := startServer(t, func() (Device, error) {
-		created <- struct{}{}
-		return newFakeDevice(), nil
+		opened <- struct{}{}
+		return dev, nil
 	})
 	client := dialSelf(t, path)
 	select {
-	case <-created:
+	case <-opened:
+	default:
+		t.Fatal("device was not opened before the client was accepted")
+	}
+	select {
+	case <-dev.created:
 		t.Fatal("device created before the client asked")
 	case <-time.After(100 * time.Millisecond):
 	}
 	if err := client.Create(); err != nil {
 		t.Fatal(err)
 	}
-	<-created
+	<-dev.created
+}
+
+// A broker that cannot open the device must say so at connect time, before
+// the client would ask for a passphrase.
+func TestUnavailableDeviceReportedAtDial(t *testing.T) {
+	path := startServer(t, func() (Device, error) { return nil, errors.New("no uhid module") })
+	c, err := Dial(path, uint32(os.Getuid()))
+	if err == nil {
+		c.Close()
+		t.Fatal("Dial succeeded although the broker cannot open the device")
+	}
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Dial() = %v, want ErrUnavailable", err)
+	}
 }
 
 func TestSecondClientRefused(t *testing.T) {
@@ -204,7 +235,9 @@ func TestClientRejectsUnexpectedBrokerUID(t *testing.T) {
 }
 
 func TestCreateFailureReachesClient(t *testing.T) {
-	path := startServer(t, func() (Device, error) { return nil, errors.New("no uhid module") })
+	dev := newFakeDevice()
+	dev.createErr = errors.New("kernel refused UHID_CREATE2")
+	path := startServer(t, func() (Device, error) { return dev, nil })
 	client := dialSelf(t, path)
 	if err := client.Create(); err == nil {
 		t.Fatal("Create succeeded although the broker had no device")
@@ -327,7 +360,7 @@ func TestSessionReportsDeviceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	dev := brokenDevice{newFakeDevice()}
-	srv := &Server{UID: os.Getuid(), NewDevice: func() (Device, error) { return dev, nil }, Logger: zap.New(core)}
+	srv := &Server{UID: os.Getuid(), OpenDevice: func() (Device, error) { return dev, nil }, Logger: zap.New(core)}
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()

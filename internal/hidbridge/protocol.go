@@ -7,9 +7,10 @@ import "fmt"
 // Wire protocol between llavero and llavero-uhid over a SOCK_SEQPACKET socket.
 // Each message is one packet:
 //
-//	broker -> client: Accepted once the broker has taken this client. A second
-//	                  client is disconnected instead, before it asks for a
-//	                  passphrase it could not use.
+//	broker -> client: Accepted once the broker has taken this client and
+//	                  opened /dev/uhid, or Unavailable if it could not open
+//	                  it. A second client is disconnected instead. Either way
+//	                  the client learns before it asks for a passphrase.
 //	client -> broker: CmdCreate once, when the client is ready to serve. Until
 //	                  then no HID device exists, so browsers see nothing while
 //	                  the vault is still locked.
@@ -24,6 +25,7 @@ const (
 
 	Ready       byte = 0
 	Accepted    byte = 7
+	Unavailable byte = 8
 	EventStart  byte = 2
 	EventStop   byte = 3
 	EventOpen   byte = 4

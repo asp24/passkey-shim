@@ -9,22 +9,32 @@ import (
 	"llavero/internal/uhid"
 )
 
-// Device is a FIDO HID device registered with the kernel through /dev/uhid.
-type Device struct{ dev *uhid.Device }
+// Device is a FIDO HID device backed by /dev/uhid. It is invisible to the
+// host until Create.
+type Device struct {
+	dev  *uhid.Device
+	uniq string
+}
 
 var _ hidbridge.Device = (*Device)(nil)
 
-// Open creates the FIDO device with the given HID_UNIQ. It needs root.
+// Open opens /dev/uhid for a FIDO device with the given HID_UNIQ, without
+// creating it yet. It needs root.
 func Open(uniq string) (*Device, error) {
 	dev, err := uhid.Open()
 	if err != nil {
 		return nil, err
 	}
-	if err := dev.Create(uniq); err != nil {
-		dev.Close()
-		return nil, fmt.Errorf("creating FIDO device: %w", err)
+	return &Device{dev: dev, uniq: uniq}, nil
+}
+
+// Create registers the device with the kernel, which makes it visible to
+// browsers.
+func (d *Device) Create() error {
+	if err := d.dev.Create(d.uniq); err != nil {
+		return fmt.Errorf("creating FIDO device: %w", err)
 	}
-	return &Device{dev: dev}, nil
+	return nil
 }
 
 // SendInput pushes one report from device to host.
