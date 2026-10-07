@@ -9,6 +9,12 @@ import (
 // Wire protocol between llavero and llavero-uhid over a SOCK_SEQPACKET socket.
 // Each message is one packet:
 //
+//	broker -> client: Accepted once the broker has taken this client. A second
+//	                  client is disconnected instead, before it asks for a
+//	                  passphrase it could not use.
+//	client -> broker: CmdCreate once, when the client is ready to serve. Until
+//	                  then no HID device exists, so browsers see nothing while
+//	                  the vault is still locked.
 //	broker -> client: Ready once the device exists, then one lifecycle byte
 //	                  (EventStart..EventClose) or EventOutput followed by a
 //	                  ReportSize-byte report from the host.
@@ -16,7 +22,10 @@ import (
 const (
 	ReportSize = 64
 
+	CmdCreate byte = 1
+
 	Ready       byte = 0
+	Accepted    byte = 7
 	EventStart  byte = 2
 	EventStop   byte = 3
 	EventOpen   byte = 4

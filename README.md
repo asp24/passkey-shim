@@ -37,7 +37,8 @@ one fixed FIDO HID device per configured user and forwards only 64-byte FIDO
 reports over a Unix socket. It checks the client's UID with `SO_PEERCRED`;
 the client also checks that the broker is root. The UHID descriptor and file
 descriptor stay inside the broker. One client may connect at a time, and its
-device disappears when it disconnects.
+device appears only once the vault is unlocked and disappears when it
+disconnects.
 
 Install and enable the broker once:
 

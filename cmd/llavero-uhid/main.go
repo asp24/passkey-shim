@@ -72,6 +72,14 @@ func serve(uid int) error {
 }
 
 func relay(conn *net.UnixConn, uid int) error {
+	if _, err := conn.Write([]byte{hidbridge.Accepted}); err != nil {
+		return err
+	}
+	// The client connects before unlocking its vault but asks for the device
+	// only afterwards, so a locked authenticator never shows up in browsers.
+	if err := awaitCreate(conn); err != nil {
+		return err
+	}
 	dev, err := uhid.Open()
 	if err != nil {
 		return err
@@ -80,7 +88,8 @@ func relay(conn *net.UnixConn, uid int) error {
 	if err := dev.Create(hidbridge.DeviceUniq(uid)); err != nil {
 		return err
 	}
-	// A ready byte confirms device creation before the client unlocks its vault.
+	// A ready byte confirms device creation, so the client fails loudly if the
+	// kernel refused it.
 	if _, err := conn.Write([]byte{hidbridge.Ready}); err != nil {
 		return err
 	}
@@ -100,6 +109,18 @@ func relay(conn *net.UnixConn, uid int) error {
 		return err
 	}
 	return readerErr
+}
+
+func awaitCreate(conn *net.UnixConn) error {
+	buf := make([]byte, 2)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return err
+	}
+	if n != 1 || buf[0] != hidbridge.CmdCreate {
+		return fmt.Errorf("expected create request, got %d-byte message", n)
+	}
+	return nil
 }
 
 func forwardReports(conn *net.UnixConn, dev interface{ SendInput([]byte) error }) error {

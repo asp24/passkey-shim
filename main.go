@@ -293,6 +293,11 @@ func run(opts options) error {
 		logf:               logf,
 	}
 
+	// Only now does the device appear, so browsers never see a key that
+	// cannot answer yet.
+	if err := dev.create(); err != nil {
+		return err
+	}
 	shutdown := func() { _ = dev.conn.Close() }
 
 	sig := make(chan os.Signal, 1)
