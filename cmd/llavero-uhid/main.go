@@ -3,8 +3,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"llavero/internal/hidbridge"
 	"llavero/internal/uhid"
 	"net"
@@ -61,7 +63,8 @@ func serve(uid int) error {
 		go func() {
 			defer active.Unlock()
 			defer conn.Close()
-			if err := relay(conn); err != nil {
+			// A client closing its socket is the normal way a session ends.
+			if err := relay(conn); err != nil && !errors.Is(err, io.EOF) {
 				fmt.Printf("client disconnected: %v\n", err)
 			}
 		}()
