@@ -1,12 +1,11 @@
-package main
-
-// Desktop notifications over the session bus.
+// Package notify posts desktop notifications over the session bus.
 //
 // Shelling out to notify-send cannot dismiss a notification once it is up, and
 // an unanswered fingerprint prompt has to disappear the moment it is answered.
 // Speaking to org.freedesktop.Notifications directly gives us the id back, so a
 // prompt can replace the previous one instead of stacking and can be closed
 // when the scan finishes.
+package notify
 
 import (
 	"sync"
@@ -26,13 +25,15 @@ const (
 	expireNever   = int32(0)
 )
 
-var (
-	notifyMu sync.Mutex
-	// promptID is the id of the live fingerprint prompt. Reusing it means a
-	// second request replaces the first banner rather than adding to a pile
-	// that never expires.
+// Desktop posts notifications to the session's notification daemon. The zero
+// value is ready to use.
+type Desktop struct {
+	mu sync.Mutex
+	// promptID is the id of the live sticky prompt. Reusing it means a second
+	// request replaces the first banner rather than adding to a pile that
+	// never expires.
 	promptID uint32
-)
+}
 
 // post sends a notification and returns its id, or 0 if the desktop has no
 // notification service. Failures are swallowed: losing a banner must never
@@ -62,26 +63,26 @@ func post(summary, body string, urgency byte, expire int32, replaces uint32) uin
 	return id
 }
 
-// notify posts a transient, self-expiring message.
-func notify(summary, body string) {
+// Notify posts a transient, self-expiring message.
+func (d *Desktop) Notify(summary, body string) {
 	post(summary, body, urgencyNormal, expireDefault, 0)
 }
 
-// notifyPrompt raises the sticky "touch the sensor" banner. It replaces any
+// Prompt raises a sticky banner, such as "touch the sensor". It replaces any
 // previous prompt so repeated requests cannot stack.
-func notifyPrompt(summary, body string) {
-	notifyMu.Lock()
-	defer notifyMu.Unlock()
-	promptID = post(summary, body, urgencyCritical, expireNever, promptID)
+func (d *Desktop) Prompt(summary, body string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.promptID = post(summary, body, urgencyCritical, expireNever, d.promptID)
 }
 
-// dismissPrompt takes the prompt down once the scan has been answered, one way
-// or the other. Without this a critical banner would sit there forever.
-func dismissPrompt() {
-	notifyMu.Lock()
-	id := promptID
-	promptID = 0
-	notifyMu.Unlock()
+// DismissPrompt takes the prompt down once it has been answered, one way or
+// the other. Without this a critical banner would sit there forever.
+func (d *Desktop) DismissPrompt() {
+	d.mu.Lock()
+	id := d.promptID
+	d.promptID = 0
+	d.mu.Unlock()
 	if id == 0 {
 		return
 	}

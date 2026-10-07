@@ -23,6 +23,7 @@ import (
 
 	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
+	"llavero/internal/notify"
 )
 
 // aaguid identifies the authenticator model, not the user or the installation.
@@ -33,6 +34,10 @@ var aaguid = [16]byte{
 }
 
 var verbose bool
+
+// desktop is shared by every component that talks to the user, so a sticky
+// prompt raised by one can be replaced or dismissed by another.
+var desktop = &notify.Desktop{}
 
 func logf(format string, args ...any) {
 	fmt.Printf("%s  %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))

@@ -118,8 +118,8 @@ func (fv *fingerprintVerifier) verify(reason string) (bool, error) {
 	}
 	defer dev.Call(fprintDeviceIfc+".VerifyStop", 0)
 
-	notifyPrompt("Touch the fingerprint sensor", reason)
-	defer dismissPrompt()
+	desktop.Prompt("Touch the fingerprint sensor", reason)
+	defer desktop.DismissPrompt()
 	fv.logf("waiting for fingerprint: %s", reason)
 
 	deadline := time.After(fingerprintTimeout)

@@ -110,16 +110,16 @@ func (a *authenticator) verifyUserFor(rpID, reason string) bool {
 	if err != nil {
 		if a.strictUV {
 			a.logf("fingerprint unavailable (%v); denying because -uv-strict is set", err)
-			notify("Fingerprint unavailable", "Request denied")
+			desktop.Notify("Fingerprint unavailable", "Request denied")
 			return false
 		}
 		a.logf("fingerprint unavailable (%v); accepting the desktop approval alone", err)
-		notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
+		desktop.Notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
 		return true
 	}
 	if !ok {
 		a.logf("fingerprint did not match")
-		notify("Fingerprint did not match", reason)
+		desktop.Notify("Fingerprint did not match", reason)
 		return false
 	}
 	if rpID != "" {
@@ -264,7 +264,7 @@ func (a *authenticator) makeCredential(body []byte) []byte {
 	}
 
 	a.logf("registered passkey for %s (%s), credential %x", req.RP.ID, label, cred.ID[:8])
-	notify("Passkey created", fmt.Sprintf("%s (%s)", req.RP.ID, label))
+	desktop.Notify("Passkey created", fmt.Sprintf("%s (%s)", req.RP.ID, label))
 	return append([]byte{statusOK}, out...)
 }
 
