@@ -9,17 +9,20 @@ import (
 )
 
 const (
-	uhidStart  = 2
-	uhidStop   = 3
-	uhidOpen   = 4
-	uhidClose  = 5
-	uhidOutput = 6
+	uhidStart  = hidbridge.EventStart
+	uhidStop   = hidbridge.EventStop
+	uhidOpen   = hidbridge.EventOpen
+	uhidClose  = hidbridge.EventClose
+	uhidOutput = hidbridge.EventOutput
 )
 
+// uhidDevice is the client end of the llavero-uhid broker socket. The broker
+// owns /dev/uhid; this side only exchanges FIDO reports with it.
 type uhidDevice struct{ conn *net.UnixConn }
+
 type uhidEvent struct {
-	kind uint32
-	data []byte
+	kind byte
+	data []byte // populated for uhidOutput
 }
 
 func openUHID() (*uhidDevice, error) {
@@ -40,38 +43,41 @@ func openUHID() (*uhidDevice, error) {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	ready := make([]byte, 2)
 	n, err := conn.Read(ready)
-	if err != nil || n != 1 || ready[0] != 0 {
+	if err != nil || n != 1 || ready[0] != hidbridge.Ready {
 		conn.Close()
 		return nil, fmt.Errorf("UHID service did not create a device (check its system journal): %v", err)
 	}
 	conn.SetReadDeadline(time.Time{})
 	return &uhidDevice{conn: conn}, nil
 }
+
+// sendInput pushes one report from device to host.
 func (d *uhidDevice) sendInput(report []byte) error {
-	if len(report) != 64 {
-		return fmt.Errorf("FIDO report must be 64 bytes")
+	if len(report) != hidbridge.ReportSize {
+		return fmt.Errorf("FIDO report must be %d bytes, got %d", hidbridge.ReportSize, len(report))
 	}
 	_, err := d.conn.Write(report)
 	return err
 }
+
 func (d *uhidDevice) read() (uhidEvent, error) {
-	buf := make([]byte, 66)
+	buf := make([]byte, hidbridge.MaxEventSize+1)
 	n, err := d.conn.Read(buf)
 	if err != nil {
 		return uhidEvent{}, err
 	}
-	if n != 1 && n != 65 {
-		return uhidEvent{}, fmt.Errorf("invalid UHID service message length %d", n)
+	if n == 0 {
+		return uhidEvent{}, fmt.Errorf("empty UHID service message")
 	}
-	kind := uint32(buf[0])
+	kind := buf[0]
 	switch kind {
 	case uhidOutput:
-		if n != 65 {
-			return uhidEvent{}, fmt.Errorf("invalid FIDO output")
+		if n != 1+hidbridge.ReportSize {
+			return uhidEvent{}, fmt.Errorf("invalid FIDO output length %d", n-1)
 		}
 	case uhidStart, uhidStop, uhidOpen, uhidClose:
 		if n != 1 {
-			return uhidEvent{}, fmt.Errorf("invalid lifecycle message")
+			return uhidEvent{}, fmt.Errorf("invalid lifecycle message length %d", n)
 		}
 	default:
 		return uhidEvent{}, fmt.Errorf("invalid UHID service event %d", kind)

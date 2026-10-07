@@ -6,6 +6,28 @@ import (
 	"net"
 )
 
+// Wire protocol between llavero and llavero-uhid over a SOCK_SEQPACKET socket.
+// Each message is one packet:
+//
+//	broker -> client: Ready once the device exists, then one lifecycle byte
+//	                  (EventStart..EventClose) or EventOutput followed by a
+//	                  ReportSize-byte report from the host.
+//	client -> broker: exactly ReportSize bytes, one input report for the host.
+const (
+	ReportSize = 64
+
+	Ready       byte = 0
+	EventStart  byte = 2
+	EventStop   byte = 3
+	EventOpen   byte = 4
+	EventClose  byte = 5
+	EventOutput byte = 6
+
+	// Receive buffers are one byte larger than the largest valid packet, so a
+	// SEQPACKET message that would be truncated shows up as too long instead.
+	MaxEventSize = 1 + ReportSize
+)
+
 func SocketPath(uid int) string { return fmt.Sprintf("/run/llavero-uhid-%d/device.sock", uid) }
 
 func PeerUID(conn *net.UnixConn) (uint32, error) {

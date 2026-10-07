@@ -13,13 +13,14 @@ import (
 	"os"
 )
 
+// Kernel event kinds from linux/uhid.h.
 const (
 	uhidDestroy = 1
-	uhidStart   = 2
-	uhidStop    = 3
-	uhidOpen    = 4
-	uhidClose   = 5
-	uhidOutput  = 6
+	EventStart  = 2
+	EventStop   = 3
+	EventOpen   = 4
+	EventClose  = 5
+	EventOutput = 6
 	uhidCreate2 = 11
 	uhidInput2  = 12
 
@@ -27,6 +28,9 @@ const (
 	EventSize = 4376
 
 	busUSB = 0x03
+
+	// Both FIDO reports in fidoReportDescriptor are this long.
+	ReportSize = 64
 )
 
 // create2 field offsets, measured from the start of the event.
@@ -108,7 +112,7 @@ func (d *Device) Destroy() error {
 
 // sendInput pushes one 64-byte report from device to host.
 func (d *Device) SendInput(report []byte) error {
-	if len(report) != 64 {
+	if len(report) != ReportSize {
 		return fmt.Errorf("FIDO report must be 64 bytes")
 	}
 	ev := make([]byte, 6+len(report))
@@ -121,7 +125,7 @@ func (d *Device) SendInput(report []byte) error {
 
 type Event struct {
 	Kind uint32
-	Data []byte // populated for uhidOutput
+	Data []byte // populated for EventOutput
 }
 
 func (d *Device) Read() (Event, error) {
@@ -137,7 +141,7 @@ func (d *Device) Read() (Event, error) {
 
 	// uhid_output_req lays out data BEFORE size, unlike input2. Getting this
 	// backwards is the classic way to lose an afternoon here.
-	if ev.Kind == uhidOutput {
+	if ev.Kind == EventOutput {
 		const (
 			outOffData  = 4
 			outOffSize  = 4100

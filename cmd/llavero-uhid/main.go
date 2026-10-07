@@ -81,7 +81,7 @@ func relay(conn *net.UnixConn) error {
 		return err
 	}
 	// A ready byte confirms device creation before the client unlocks its vault.
-	if _, err := conn.Write([]byte{0}); err != nil {
+	if _, err := conn.Write([]byte{hidbridge.Ready}); err != nil {
 		return err
 	}
 	// Closing the socket on either direction's failure wakes the other direction.
@@ -103,13 +103,13 @@ func relay(conn *net.UnixConn) error {
 }
 
 func forwardReports(conn *net.UnixConn, dev interface{ SendInput([]byte) error }) error {
-	buf := make([]byte, 65)
+	buf := make([]byte, hidbridge.ReportSize+1)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
 			return err
 		}
-		if n != 64 {
+		if n != hidbridge.ReportSize {
 			return fmt.Errorf("invalid report length %d", n)
 		}
 		if err := dev.SendInput(buf[:n]); err != nil {
@@ -126,13 +126,19 @@ func forwardEvents(conn *net.UnixConn, dev *uhid.Device) error {
 		}
 		var packet []byte
 		switch ev.Kind {
-		case 2, 3, 4, 5:
-			packet = []byte{byte(ev.Kind)}
-		case 6:
-			if len(ev.Data) != 64 {
+		case uhid.EventStart:
+			packet = []byte{hidbridge.EventStart}
+		case uhid.EventStop:
+			packet = []byte{hidbridge.EventStop}
+		case uhid.EventOpen:
+			packet = []byte{hidbridge.EventOpen}
+		case uhid.EventClose:
+			packet = []byte{hidbridge.EventClose}
+		case uhid.EventOutput:
+			if len(ev.Data) != hidbridge.ReportSize {
 				return fmt.Errorf("invalid kernel FIDO report length %d", len(ev.Data))
 			}
-			packet = append([]byte{6}, ev.Data...)
+			packet = append([]byte{hidbridge.EventOutput}, ev.Data...)
 		default:
 			continue
 		}
