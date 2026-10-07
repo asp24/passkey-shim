@@ -135,9 +135,22 @@ func DefaultPath() string {
 	return filepath.Join(dir, "llavero", "vault.pkv")
 }
 
-// tpmBlobPath keeps the sealed secret beside the vault. Both are needed, and
-// neither is useful without this machine's TPM.
-func tpmBlobPath(vaultPath string) string { return vaultPath + ".tpm" }
+// SealedBlobPath is where the sealed TPM secret of the vault at vaultPath
+// lives. Both files are needed, and neither is useful without this machine's
+// TPM.
+func SealedBlobPath(vaultPath string) string { return vaultPath + ".tpm" }
+
+// PreviousBlobPath is where Rekey parks the sealed blob it replaced, until
+// RemovePreviousBlob confirms it is no longer needed.
+func PreviousBlobPath(vaultPath string) string { return SealedBlobPath(vaultPath) + ".old" }
+
+// pendingBlobPath holds a new sealed blob while Rekey writes the vault that
+// needs it.
+func pendingBlobPath(vaultPath string) string { return SealedBlobPath(vaultPath) + ".new" }
+
+// renameFile is os.Rename. Tests replace it to fail at a chosen step of a
+// save or rekey.
+var renameFile = os.Rename
 
 // deriveVaultKey combines whichever factors the mode calls for. HKDF is the
 // combiner so that adding a factor cannot weaken the result.
@@ -249,7 +262,7 @@ func Open(path string, passphrase []byte, sealer Sealer) (*Vault, error) {
 		if sealer == nil {
 			return nil, errors.New("this vault is TPM-bound but no TPM is configured")
 		}
-		blob, err := os.ReadFile(tpmBlobPath(path))
+		blob, err := os.ReadFile(SealedBlobPath(path))
 		if err != nil {
 			return nil, fmt.Errorf("this vault is TPM-bound but its sealed blob is unreadable: %w", err)
 		}
@@ -303,7 +316,7 @@ func Create(path string, mode UnlockMode, passphrase []byte, sealer Sealer) (*Va
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, fmt.Errorf("creating vault directory: %w", err)
 		}
-		if tpmSecret, err = sealNewSecret(sealer, path); err != nil {
+		if tpmSecret, err = sealNewSecret(sealer, SealedBlobPath(path)); err != nil {
 			return nil, err
 		}
 	}
@@ -320,9 +333,9 @@ func Create(path string, mode UnlockMode, passphrase []byte, sealer Sealer) (*Va
 }
 
 // sealNewSecret generates a TPM secret, seals it with sealer and writes the
-// blob beside the vault at path. Its errors name the failed step, so callers
-// return them as they are.
-func sealNewSecret(sealer Sealer, path string) ([]byte, error) {
+// blob to blobPath. Its errors name the failed step, so callers return them as
+// they are.
+func sealNewSecret(sealer Sealer, blobPath string) ([]byte, error) {
 	if sealer == nil {
 		return nil, errors.New("this unlock mode needs a TPM but none is configured")
 	}
@@ -334,7 +347,7 @@ func sealNewSecret(sealer Sealer, path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sealing the vault's TPM secret: %w", err)
 	}
-	if err := os.WriteFile(tpmBlobPath(path), blob, 0o600); err != nil {
+	if err := os.WriteFile(blobPath, blob, 0o600); err != nil {
 		return nil, fmt.Errorf("writing sealed blob: %w", err)
 	}
 	return secret, nil
@@ -351,7 +364,15 @@ func randomBytes(n int, what string) ([]byte, error) {
 }
 
 // Rekey rewrites an already-open vault under a new mode, preserving every
-// credential. The caller is responsible for having backed up the old file.
+// credential.
+//
+// The vault file and its sealed blob must change together, or neither opens.
+// So a new blob is written beside the current one first, and the vault is
+// saved under the new key. If that fails, the new blob is dropped and the
+// files on disk and this Vault are exactly as before. Once the vault is
+// saved, the current blob is parked at PreviousBlobPath and the new one moved
+// into place. Call RemovePreviousBlob after confirming the rekeyed vault
+// opens.
 func (v *Vault) Rekey(mode UnlockMode, passphrase []byte) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -361,20 +382,60 @@ func (v *Vault) Rekey(mode UnlockMode, passphrase []byte) error {
 		return err
 	}
 
+	pending := pendingBlobPath(v.path)
 	var tpmSecret []byte
 	if mode.NeedsTPM() {
-		if tpmSecret, err = sealNewSecret(v.sealer, v.path); err != nil {
+		if tpmSecret, err = sealNewSecret(v.sealer, pending); err != nil {
+			_ = os.Remove(pending)
 			return err
 		}
 	}
 
 	key, err := deriveVaultKey(mode, salt, passphrase, tpmSecret, false)
 	if err != nil {
+		_ = os.Remove(pending)
 		return fmt.Errorf("deriving vault key: %w", err)
 	}
+
+	oldKey, oldSalt, oldMode, oldUpgraded := v.key, v.salt, v.mode, v.upgradedFromV1
 	v.key, v.salt, v.mode, v.upgradedFromV1 = key, salt, mode, false
 	if err := v.save(); err != nil {
-		return fmt.Errorf("writing rekeyed vault: %w", err)
+		v.key, v.salt, v.mode, v.upgradedFromV1 = oldKey, oldSalt, oldMode, oldUpgraded
+		_ = os.Remove(pending)
+		return fmt.Errorf("writing rekeyed vault (the vault and its sealed blob are unchanged): %w", err)
+	}
+	return v.swapBlobs(oldMode.NeedsTPM(), mode.NeedsTPM())
+}
+
+// swapBlobs runs after the rekeyed vault is on disk: it parks the blob the
+// old key needed and moves the new one, if any, into place. A failure here
+// leaves the vault rekeyed and every blob on disk, so the error says how to
+// finish by hand.
+func (v *Vault) swapBlobs(hadBlob, needsBlob bool) error {
+	current, previous, pending := SealedBlobPath(v.path), PreviousBlobPath(v.path), pendingBlobPath(v.path)
+	if hadBlob {
+		if err := renameFile(current, previous); err != nil && needsBlob {
+			return fmt.Errorf("the vault was rekeyed, but its new sealed blob could not be put in place; "+
+				"to finish, rename %s to %s and then %s to %s: %w", current, previous, pending, current, err)
+		}
+		// Without a new blob the old one is merely stale, so a failed park
+		// costs nothing.
+	}
+	if needsBlob {
+		if err := renameFile(pending, current); err != nil {
+			return fmt.Errorf("the vault was rekeyed, but its new sealed blob is still at %s; "+
+				"rename it to %s to finish (the previous blob is at %s): %w", pending, current, previous, err)
+		}
+	}
+	return nil
+}
+
+// RemovePreviousBlob deletes the sealed blob a Rekey parked. Call it only
+// after the rekeyed vault has been reopened. A missing file is not an error.
+func (v *Vault) RemovePreviousBlob() error {
+	err := os.Remove(PreviousBlobPath(v.path))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing previous sealed blob: %w", err)
 	}
 	return nil
 }
@@ -456,7 +517,7 @@ func (v *Vault) save() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("closing vault temp file: %w", err)
 	}
-	if err := os.Rename(tmp.Name(), v.path); err != nil {
+	if err := renameFile(tmp.Name(), v.path); err != nil {
 		return fmt.Errorf("replacing vault: %w", err)
 	}
 	return nil
