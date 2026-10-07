@@ -9,5 +9,5 @@ it is done. Delete a note in the commit that resolves it.
 | 04 | [Move internal/uhid under the kernel adapter](04-move-uhid-under-kernel-adapter.md) | structure |
 | 05 | [Tests for fingerprint, notify and approval](05-tests-for-desktop-integrations.md) | test coverage |
 | 06 | [Another user's device is visible to the active seat](06-other-users-device-visible-to-active-seat.md) | security |
-| 07 | [Wrap returned errors](07-wrap-returned-errors.md) | error handling |
 | 08 | [ctaptest writes a real passkey](08-ctaptest-writes-real-passkey.md) | tooling |
+| 09 | [Rekey overwrites the sealed blob before the vault is safe](09-rekey-overwrites-sealed-blob.md) | data loss |
