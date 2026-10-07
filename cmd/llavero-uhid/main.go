@@ -3,16 +3,14 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"llavero/internal/hidbridge"
-	"llavero/internal/uhid"
-	"net"
+	"log"
 	"os"
 	"strconv"
-	"sync"
+
+	"llavero/internal/hidbridge"
+	"llavero/internal/uhid"
 )
 
 func main() {
@@ -31,140 +29,59 @@ func main() {
 }
 
 func serve(uid int) error {
-	path := hidbridge.SocketPath(uid)
-	// systemd creates the root-owned runtime directory. Never remove an existing
-	// socket: a second broker must not take over a running broker's endpoint.
-	listener, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: path, Net: "unixpacket"})
+	// systemd creates the root-owned runtime directory.
+	listener, err := hidbridge.Listen(hidbridge.SocketPath(uid), uid)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-	if err := os.Chown(path, uid, -1); err != nil {
-		return err
+	srv := &hidbridge.Server{
+		UID:       uid,
+		NewDevice: func() (hidbridge.Device, error) { return newKernelDevice(hidbridge.DeviceUniq(uid)) },
+		Logf:      log.New(os.Stdout, "", 0).Printf,
 	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return err
-	}
-	var active sync.Mutex
-	for {
-		conn, err := listener.AcceptUnix()
-		if err != nil {
-			return err
-		}
-		peer, err := hidbridge.PeerUID(conn)
-		if err != nil || peer != uint32(uid) {
-			conn.Close()
-			continue
-		}
-		if !active.TryLock() {
-			conn.Close()
-			continue
-		}
-		go func() {
-			defer active.Unlock()
-			defer conn.Close()
-			// A client closing its socket is the normal way a session ends.
-			if err := relay(conn, uid); err != nil && !errors.Is(err, io.EOF) {
-				fmt.Printf("client disconnected: %v\n", err)
-			}
-		}()
-	}
+	return srv.Serve(listener)
 }
 
-func relay(conn *net.UnixConn, uid int) error {
-	if _, err := conn.Write([]byte{hidbridge.Accepted}); err != nil {
-		return err
-	}
-	// The client connects before unlocking its vault but asks for the device
-	// only afterwards, so a locked authenticator never shows up in browsers.
-	if err := awaitCreate(conn); err != nil {
-		return err
-	}
+// kernelDevice adapts a /dev/uhid device to the broker protocol, so kernel
+// event numbers stay inside this binary.
+type kernelDevice struct{ dev *uhid.Device }
+
+func newKernelDevice(uniq string) (*kernelDevice, error) {
 	dev, err := uhid.Open()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer dev.Close()
-	if err := dev.Create(hidbridge.DeviceUniq(uid)); err != nil {
-		return err
+	if err := dev.Create(uniq); err != nil {
+		dev.Close()
+		return nil, err
 	}
-	// A ready byte confirms device creation, so the client fails loudly if the
-	// kernel refused it.
-	if _, err := conn.Write([]byte{hidbridge.Ready}); err != nil {
-		return err
-	}
-	// Closing the socket on either direction's failure wakes the other direction.
-	// The kernel reader is nonblocking through os.File's poller, so Close wakes it.
-	done := make(chan error, 1)
-	go func() {
-		err := forwardEvents(conn, dev)
-		conn.Close()
-		done <- err
-	}()
-	err = forwardReports(conn, dev)
-	conn.Close()
-	dev.Close()
-	readerErr := <-done
-	if err != nil {
-		return err
-	}
-	return readerErr
+	return &kernelDevice{dev: dev}, nil
 }
 
-func awaitCreate(conn *net.UnixConn) error {
-	buf := make([]byte, 2)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return err
-	}
-	if n != 1 || buf[0] != hidbridge.CmdCreate {
-		return fmt.Errorf("expected create request, got %d-byte message", n)
-	}
-	return nil
-}
+func (d *kernelDevice) SendInput(report []byte) error { return d.dev.SendInput(report) }
 
-func forwardReports(conn *net.UnixConn, dev interface{ SendInput([]byte) error }) error {
-	buf := make([]byte, hidbridge.ReportSize+1)
+func (d *kernelDevice) Close() error { return d.dev.Close() }
+
+// Read returns the next kernel event the client cares about, skipping the
+// rest (feature and report requests a FIDO device never answers).
+func (d *kernelDevice) Read() (hidbridge.Event, error) {
 	for {
-		n, err := conn.Read(buf)
+		ev, err := d.dev.Read()
 		if err != nil {
-			return err
+			return hidbridge.Event{}, err
 		}
-		if n != hidbridge.ReportSize {
-			return fmt.Errorf("invalid report length %d", n)
-		}
-		if err := dev.SendInput(buf[:n]); err != nil {
-			return err
-		}
-	}
-}
-
-func forwardEvents(conn *net.UnixConn, dev *uhid.Device) error {
-	for {
-		ev, err := dev.Read()
-		if err != nil {
-			return err
-		}
-		var packet []byte
 		switch ev.Kind {
 		case uhid.EventStart:
-			packet = []byte{hidbridge.EventStart}
+			return hidbridge.Event{Kind: hidbridge.EventStart}, nil
 		case uhid.EventStop:
-			packet = []byte{hidbridge.EventStop}
+			return hidbridge.Event{Kind: hidbridge.EventStop}, nil
 		case uhid.EventOpen:
-			packet = []byte{hidbridge.EventOpen}
+			return hidbridge.Event{Kind: hidbridge.EventOpen}, nil
 		case uhid.EventClose:
-			packet = []byte{hidbridge.EventClose}
+			return hidbridge.Event{Kind: hidbridge.EventClose}, nil
 		case uhid.EventOutput:
-			if len(ev.Data) != hidbridge.ReportSize {
-				return fmt.Errorf("invalid kernel FIDO report length %d", len(ev.Data))
-			}
-			packet = append([]byte{hidbridge.EventOutput}, ev.Data...)
-		default:
-			continue
-		}
-		if _, err := conn.Write(packet); err != nil {
-			return err
+			return hidbridge.Event{Kind: hidbridge.EventOutput, Data: ev.Data}, nil
 		}
 	}
 }
