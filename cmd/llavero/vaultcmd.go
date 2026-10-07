@@ -93,12 +93,23 @@ func (a *app) runRekey() error {
 	}
 
 	// Back up before touching anything. A failed rekey must never be the
-	// reason someone loses their passkeys.
-	backup := fmt.Sprintf("%s.bak-%s", opts.vaultPath, time.Now().Format("20060102-150405"))
+	// reason someone loses their passkeys. A TPM-bound vault is useless
+	// without its sealed blob, so that is backed up too.
+	stamp := time.Now().Format("20060102-150405")
+	backup := fmt.Sprintf("%s.bak-%s", opts.vaultPath, stamp)
 	if err := copyFile(opts.vaultPath, backup); err != nil {
 		return fmt.Errorf("could not back up the vault, refusing to rekey: %w", err)
 	}
-	a.log.Info("backed up the existing vault", zap.String("backup", backup))
+	backups := backup
+	if v.Mode().NeedsTPM() {
+		blob := vault.SealedBlobPath(opts.vaultPath)
+		blobBackup := fmt.Sprintf("%s.bak-%s", blob, stamp)
+		if err := copyFile(blob, blobBackup); err != nil {
+			return fmt.Errorf("could not back up the sealed blob, refusing to rekey: %w", err)
+		}
+		backups = fmt.Sprintf("%s with %s (restore both, as %s and %s)", backup, blobBackup, opts.vaultPath, blob)
+	}
+	a.log.Info("backed up the existing vault", zap.String("backup", backups))
 
 	var newPass []byte
 	if newMode.NeedsPassphrase() {
@@ -111,19 +122,24 @@ func (a *app) runRekey() error {
 	}
 
 	if err := v.Rekey(newMode, newPass); err != nil {
-		return fmt.Errorf("rekey failed (your backup at %s is still good): %w", backup, err)
+		return fmt.Errorf("rekey failed (backup: %s): %w", backups, err)
 	}
 	a.log.Info("rekeyed", zap.Stringer("unlock", newMode), zap.Int("passkeys", v.Count()))
 
 	// Prove the new file actually opens before declaring success.
+	// Until it does, the previous sealed blob stays parked beside it.
 	check, err := vault.Open(opts.vaultPath, newPass, tpm.Sealer{})
 	if err != nil {
-		return fmt.Errorf("the rekeyed vault does not reopen (restore from %s): %w", backup, err)
+		return fmt.Errorf("the rekeyed vault does not reopen (restore from %s): %w", backups, err)
 	}
 	if check.Count() != v.Count() {
-		return fmt.Errorf("credential count changed during rekey (restore from %s)", backup)
+		return fmt.Errorf("credential count changed during rekey (restore from %s)", backups)
 	}
 	a.log.Info("verified: the rekeyed vault reopens", zap.Int("passkeys", check.Count()))
+	if err := v.RemovePreviousBlob(); err != nil {
+		a.log.Warn("could not remove the previous sealed blob; it is safe to delete by hand",
+			zap.String("path", vault.PreviousBlobPath(opts.vaultPath)), zap.Error(err))
+	}
 	return nil
 }
 

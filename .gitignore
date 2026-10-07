@@ -10,3 +10,6 @@
 *.pkv
 *.pkv.tpm
 *.pkv.bak-*
+*.pkv.tpm.bak-*
+*.pkv.tpm.new
+*.pkv.tpm.old
