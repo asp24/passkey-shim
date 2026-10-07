@@ -151,7 +151,11 @@ func deriveVaultKey(mode UnlockMode, salt, passphrase, tpmSecret []byte, legacyV
 		if mode != ModePassphrase {
 			return nil, errors.New("version 1 vaults are passphrase-only")
 		}
-		return pbkdf2.Key(sha256.New, string(passphrase), salt, kdfIterations, 32)
+		key, err := pbkdf2.Key(sha256.New, string(passphrase), salt, kdfIterations, 32)
+		if err != nil {
+			return nil, fmt.Errorf("stretching passphrase: %w", err)
+		}
+		return key, nil
 	}
 
 	var ikm []byte
@@ -159,7 +163,7 @@ func deriveVaultKey(mode UnlockMode, salt, passphrase, tpmSecret []byte, legacyV
 	if mode.NeedsPassphrase() {
 		stretched, err := pbkdf2.Key(sha256.New, string(passphrase), salt, kdfIterations, 32)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("stretching passphrase: %w", err)
 		}
 		ikm = append(ikm, stretched...)
 	}
@@ -189,7 +193,7 @@ func deriveVaultKey(mode UnlockMode, salt, passphrase, tpmSecret []byte, legacyV
 func ReadMode(path string) (UnlockMode, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("reading vault: %w", err)
 	}
 	if len(raw) < headerLenV1 || string(raw[0:4]) != vaultMagic {
 		return 0, errors.New("not a llavero vault file")
@@ -212,7 +216,7 @@ func ReadMode(path string) (UnlockMode, error) {
 func Open(path string, passphrase []byte, sealer Sealer) (*Vault, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading vault: %w", err)
 	}
 	if len(raw) < headerLenV1 || string(raw[0:4]) != vaultMagic {
 		return nil, errors.New("not a llavero vault file")
@@ -251,13 +255,13 @@ func Open(path string, passphrase []byte, sealer Sealer) (*Vault, error) {
 		}
 		tpmSecret, err = sealer.Unseal(blob)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("unsealing the vault's TPM secret: %w", err)
 		}
 	}
 
 	key, err := deriveVaultKey(mode, salt, passphrase, tpmSecret, legacyV1)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("deriving vault key: %w", err)
 	}
 	plain, err := decrypt(key, nonce, raw[:headerLen], ciphertext)
 	if err != nil {
@@ -274,7 +278,7 @@ func Open(path string, passphrase []byte, sealer Sealer) (*Vault, error) {
 	if legacyV1 {
 		upgraded, err := deriveVaultKey(mode, salt, passphrase, nil, false)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("deriving upgraded vault key: %w", err)
 		}
 		key = upgraded
 	}
@@ -289,41 +293,61 @@ func Open(path string, passphrase []byte, sealer Sealer) (*Vault, error) {
 // Create writes a brand new empty vault in the requested mode, sealing a
 // fresh TPM secret with sealer if the mode needs one.
 func Create(path string, mode UnlockMode, passphrase []byte, sealer Sealer) (*Vault, error) {
-	salt := make([]byte, saltLen)
-	if _, err := rand.Read(salt); err != nil {
+	salt, err := randomBytes(saltLen, "salt")
+	if err != nil {
 		return nil, err
 	}
 
 	var tpmSecret []byte
 	if mode.NeedsTPM() {
-		if sealer == nil {
-			return nil, errors.New("this unlock mode needs a TPM but none is configured")
-		}
-		tpmSecret = make([]byte, tpmSecretLen)
-		if _, err := rand.Read(tpmSecret); err != nil {
-			return nil, err
-		}
-		blob, err := sealer.Seal(tpmSecret)
-		if err != nil {
-			return nil, err
-		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("creating vault directory: %w", err)
 		}
-		if err := os.WriteFile(tpmBlobPath(path), blob, 0o600); err != nil {
-			return nil, fmt.Errorf("writing sealed blob: %w", err)
+		if tpmSecret, err = sealNewSecret(sealer, path); err != nil {
+			return nil, err
 		}
 	}
 
 	key, err := deriveVaultKey(mode, salt, passphrase, tpmSecret, false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("deriving vault key: %w", err)
 	}
 	v := &Vault{path: path, sealer: sealer, key: key, salt: salt, mode: mode}
 	if err := v.save(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("writing new vault: %w", err)
 	}
 	return v, nil
+}
+
+// sealNewSecret generates a TPM secret, seals it with sealer and writes the
+// blob beside the vault at path. Its errors name the failed step, so callers
+// return them as they are.
+func sealNewSecret(sealer Sealer, path string) ([]byte, error) {
+	if sealer == nil {
+		return nil, errors.New("this unlock mode needs a TPM but none is configured")
+	}
+	secret, err := randomBytes(tpmSecretLen, "TPM secret")
+	if err != nil {
+		return nil, err
+	}
+	blob, err := sealer.Seal(secret)
+	if err != nil {
+		return nil, fmt.Errorf("sealing the vault's TPM secret: %w", err)
+	}
+	if err := os.WriteFile(tpmBlobPath(path), blob, 0o600); err != nil {
+		return nil, fmt.Errorf("writing sealed blob: %w", err)
+	}
+	return secret, nil
+}
+
+// randomBytes returns n bytes from the system CSPRNG. Its error names what
+// was being generated, so callers return it as it is.
+func randomBytes(n int, what string) ([]byte, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("generating %s: %w", what, err)
+	}
+	return b, nil
 }
 
 // Rekey rewrites an already-open vault under a new mode, preserving every
@@ -332,43 +356,47 @@ func (v *Vault) Rekey(mode UnlockMode, passphrase []byte) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	salt := make([]byte, saltLen)
-	if _, err := rand.Read(salt); err != nil {
+	salt, err := randomBytes(saltLen, "salt")
+	if err != nil {
 		return err
 	}
 
 	var tpmSecret []byte
 	if mode.NeedsTPM() {
-		if v.sealer == nil {
-			return errors.New("this unlock mode needs a TPM but none is configured")
-		}
-		tpmSecret = make([]byte, tpmSecretLen)
-		if _, err := rand.Read(tpmSecret); err != nil {
+		if tpmSecret, err = sealNewSecret(v.sealer, v.path); err != nil {
 			return err
-		}
-		blob, err := v.sealer.Seal(tpmSecret)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(tpmBlobPath(v.path), blob, 0o600); err != nil {
-			return fmt.Errorf("writing sealed blob: %w", err)
 		}
 	}
 
 	key, err := deriveVaultKey(mode, salt, passphrase, tpmSecret, false)
 	if err != nil {
-		return err
+		return fmt.Errorf("deriving vault key: %w", err)
 	}
 	v.key, v.salt, v.mode, v.upgradedFromV1 = key, salt, mode, false
-	return v.save()
+	if err := v.save(); err != nil {
+		return fmt.Errorf("writing rekeyed vault: %w", err)
+	}
+	return nil
 }
 
-func decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
+// newGCM returns AES-256-GCM under key. Its errors name the failed step, so
+// callers return them as they are.
+func newGCM(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("initialising AES: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("initialising GCM: %w", err)
+	}
+	return gcm, nil
+}
+
+// decrypt opens ciphertext. An authentication failure comes back as the bare
+// gcm.Open error, which callers turn into ErrBadPassphrase.
+func decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
+	gcm, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
@@ -380,13 +408,13 @@ func decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
 func (v *Vault) save() error {
 	plain, err := json.Marshal(v.contents)
 	if err != nil {
-		return err
+		return fmt.Errorf("encoding vault contents: %w", err)
 	}
 
 	// A fresh nonce on every write. Reusing one under the same key would leak
 	// plaintext, and we rewrite the file on every registration and sign-in.
-	nonce := make([]byte, nonceLen)
-	if _, err := rand.Read(nonce); err != nil {
+	nonce, err := randomBytes(nonceLen, "nonce")
+	if err != nil {
 		return err
 	}
 
@@ -397,42 +425,41 @@ func (v *Vault) save() error {
 	header = append(header, v.salt...)
 	header = append(header, nonce...)
 
-	block, err := aes.NewCipher(v.key)
-	if err != nil {
-		return err
-	}
-	gcm, err := cipher.NewGCM(block)
+	gcm, err := newGCM(v.key)
 	if err != nil {
 		return err
 	}
 	ciphertext := gcm.Seal(nil, nonce, plain, header)
 
 	if err := os.MkdirAll(filepath.Dir(v.path), 0o700); err != nil {
-		return err
+		return fmt.Errorf("creating vault directory: %w", err)
 	}
 	// Write-then-rename so a crash mid-write cannot leave half a vault. The
 	// temp file shares the directory so the rename stays on one filesystem.
 	tmp, err := os.CreateTemp(filepath.Dir(v.path), ".vault-*.tmp")
 	if err != nil {
-		return err
+		return fmt.Errorf("creating vault temp file: %w", err)
 	}
 	defer os.Remove(tmp.Name())
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return err
+		return fmt.Errorf("restricting vault temp file: %w", err)
 	}
 	if _, err := tmp.Write(append(header, ciphertext...)); err != nil {
 		tmp.Close()
-		return err
+		return fmt.Errorf("writing vault temp file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return err
+		return fmt.Errorf("syncing vault temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return fmt.Errorf("closing vault temp file: %w", err)
 	}
-	return os.Rename(tmp.Name(), v.path)
+	if err := os.Rename(tmp.Name(), v.path); err != nil {
+		return fmt.Errorf("replacing vault: %w", err)
+	}
+	return nil
 }
 
 // Account names the relying party and user a new credential is minted for.
@@ -458,14 +485,14 @@ func (v *Vault) AddCredential(acct Account) (*Credential, *ecdsa.PrivateKey, err
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("generating key pair: %w", err)
 	}
 	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("encoding private key: %w", err)
 	}
-	id := make([]byte, credentialIDLen)
-	if _, err := rand.Read(id); err != nil {
+	id, err := randomBytes(credentialIDLen, "credential id")
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -498,7 +525,7 @@ func (v *Vault) AddCredential(acct Account) (*Credential, *ecdsa.PrivateKey, err
 	}
 
 	if err := v.save(); err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("saving new credential: %w", err)
 	}
 	return &cred, priv, nil
 }
@@ -555,7 +582,10 @@ func (v *Vault) BumpSignCount(id []byte) (uint32, error) {
 		if string(v.contents.Credentials[i].ID) == string(id) {
 			v.contents.Credentials[i].SignCount++
 			n := v.contents.Credentials[i].SignCount
-			return n, v.save()
+			if err := v.save(); err != nil {
+				return 0, fmt.Errorf("saving sign count: %w", err)
+			}
+			return n, nil
 		}
 	}
 	return 0, errors.New("credential not found")
@@ -589,7 +619,7 @@ func (v *Vault) Remove(pred func(Credential) bool) ([]Credential, error) {
 	}
 	v.contents.Credentials = kept
 	if err := v.save(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("saving after removal: %w", err)
 	}
 	return gone, nil
 }
