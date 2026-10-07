@@ -1,6 +1,10 @@
 # Build output
 /llavero
 /ctaptest
+/llavero-uhid
+
+# IDE metadata
+.idea/
 
 # Never commit a vault or its sealed TPM blob, even a test one.
 *.pkv
