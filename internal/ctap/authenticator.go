@@ -161,10 +161,31 @@ func denied(ctx context.Context) []byte {
 // declined, could not be asked, or the host cancelled. With fingerprint
 // consent the touch is the whole interaction; otherwise the menu runs first
 // and the touch confirms it.
+//
+// If the sensor turns out to be unusable under fingerprint consent, the menu
+// runs after all. Treating the broken sensor as approval, as verifyUserFor
+// does, would be wrong here: no prompt has been answered, so the request
+// would go through with no user interaction at all.
 func (a *Authenticator) requestConsent(ctx context.Context, rpID, title, affirmative, reason string) bool {
-	if a.consentIsFingerprint() {
-		return a.verifyUserFor(ctx, rpID, reason)
+	if !a.consentIsFingerprint() {
+		return a.confirm(ctx, title, affirmative, reason) && a.verifyUserFor(ctx, rpID, reason)
 	}
+	ok, err := a.scan(ctx, rpID, reason)
+	if err == nil {
+		return ok
+	}
+	if a.strictUV {
+		a.denyUnavailable(err)
+		return false
+	}
+	a.log.Warn("fingerprint unavailable; asking for approval on the desktop instead", zap.Error(err))
+	a.notifier.Notify("Fingerprint unavailable", "Approve on the desktop instead")
+	return a.confirm(ctx, title, affirmative, reason)
+}
+
+// confirm shows the approval menu and reports whether the user picked
+// affirmative.
+func (a *Authenticator) confirm(ctx context.Context, title, affirmative, reason string) bool {
 	choice, err := a.approver.Confirm(ctx, title, []string{affirmative, "Cancel"})
 	if ctx.Err() != nil {
 		a.log.Info("cancelled by the host while asking for approval", zap.String("reason", reason))
@@ -178,12 +199,11 @@ func (a *Authenticator) requestConsent(ctx context.Context, rpID, title, affirma
 		a.log.Info("declined by user", zap.String("reason", reason))
 		return false
 	}
-	return a.verifyUserFor(ctx, rpID, reason)
+	return true
 }
 
 // verifyUserFor is the biometric half of user verification. Consent (the
-// menu) has already happened by the time this runs. Naming a site lets a scan
-// for it be reused within the grace window.
+// menu) has already happened by the time this runs.
 //
 // A sensor that cannot be used is treated differently from a finger that does
 // not match. A non-match denies, always. A hardware failure falls back to the
@@ -191,44 +211,62 @@ func (a *Authenticator) requestConsent(ctx context.Context, rpID, title, affirma
 // known to wedge after suspend, and a vault that locks you out of every
 // account until you reboot is a worse outcome than one that leans on the
 // prompt you already answered. Run with --uv-strict to invert that.
-//
-// A cancelled request is never mistaken for a broken sensor: the lenient
-// fallback would otherwise approve a request the host already abandoned.
 func (a *Authenticator) verifyUserFor(ctx context.Context, rpID, reason string) bool {
-	if ctx.Err() != nil {
+	ok, err := a.scan(ctx, rpID, reason)
+	if err == nil {
+		return ok
+	}
+	if a.strictUV {
+		a.denyUnavailable(err)
 		return false
 	}
+	a.log.Warn("fingerprint unavailable; accepting the desktop approval alone", zap.Error(err))
+	a.notifier.Notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
+	return true
+}
+
+// scan runs the fingerprint check. A non-nil error means the sensor could not
+// be used, and leaves the decision to the caller; otherwise ok says whether
+// the user passed. Naming a site lets a scan for it be reused within the
+// grace window.
+//
+// A cancelled request is never reported as a broken sensor: the lenient
+// fallbacks would otherwise approve a request the host already abandoned.
+func (a *Authenticator) scan(ctx context.Context, rpID, reason string) (bool, error) {
+	if ctx.Err() != nil {
+		return false, nil
+	}
 	if a.verifier == nil {
-		return true
+		return true, nil
 	}
 	if rpID != "" && a.recentlyVerified(rpID) {
 		a.log.Info("reusing the scan from moments ago", zap.String("rp", rpID))
-		return true
+		return true, nil
 	}
 	ok, err := a.verifier.Verify(ctx, reason)
 	if ctx.Err() != nil {
 		a.log.Info("cancelled by the host during the fingerprint scan", zap.String("reason", reason))
-		return false
+		return false, nil
 	}
 	if err != nil {
-		if a.strictUV {
-			a.log.Warn("fingerprint unavailable; denying because strict verification is on", zap.Error(err))
-			a.notifier.Notify("Fingerprint unavailable", "Request denied")
-			return false
-		}
-		a.log.Warn("fingerprint unavailable; accepting the desktop approval alone", zap.Error(err))
-		a.notifier.Notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
-		return true
+		return false, err
 	}
 	if !ok {
 		a.log.Info("fingerprint did not match", zap.String("reason", reason))
 		a.notifier.Notify("Fingerprint did not match", reason)
-		return false
+		return false, nil
 	}
 	if rpID != "" {
 		a.markVerified(rpID)
 	}
-	return true
+	return true, nil
+}
+
+// denyUnavailable reports a request refused because strict verification is on
+// and the sensor could not be used.
+func (a *Authenticator) denyUnavailable(err error) {
+	a.log.Warn("fingerprint unavailable; denying because strict verification is on", zap.Error(err))
+	a.notifier.Notify("Fingerprint unavailable", "Request denied")
 }
 
 // Handle decodes one CTAP2 message and returns the raw response, status byte

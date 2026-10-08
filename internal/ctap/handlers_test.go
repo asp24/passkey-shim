@@ -382,6 +382,63 @@ func TestFingerprintConsentNeedsVerifier(t *testing.T) {
 	}
 }
 
+// countingApprover records how often the approval menu was shown.
+type countingApprover struct {
+	fakeApprover
+	calls int
+}
+
+func (c *countingApprover) Confirm(ctx context.Context, title string, choices []string) (string, error) {
+	c.calls++
+	return c.fakeApprover.Confirm(ctx, title, choices)
+}
+
+// Under fingerprint consent the touch is the only interaction, so a sensor
+// that cannot be used must never count as approval. Lenient mode asks on the
+// desktop instead; strict mode denies.
+func TestFingerprintConsentWithoutSensor(t *testing.T) {
+	unavailable := errors.New("sensor wedged")
+	tests := []struct {
+		name     string
+		match    bool
+		err      error
+		strict   bool
+		decline  bool
+		want     byte
+		wantMenu bool
+	}{
+		{"finger matches", true, nil, false, false, statusOK, false},
+		{"finger does not match", false, nil, false, false, statusOperationDenied, false},
+		{"sensor broken, lenient, approved on the desktop", false, unavailable, false, false, statusOK, true},
+		{"sensor broken, lenient, declined on the desktop", false, unavailable, false, true, statusOperationDenied, true},
+		{"sensor broken, strict", false, unavailable, true, false, statusOperationDenied, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &memStore{}
+			ap := &countingApprover{fakeApprover: fakeApprover{decline: tt.decline}}
+			uv := &fakeVerifier{match: tt.match, err: tt.err}
+			a := newTestAuthenticator(t, store, ap, uv, func(c *Config) {
+				c.FingerprintConsent = true
+				c.StrictUV = tt.strict
+			})
+			resp := a.Handle(context.Background(), command(t, ctapMakeCredential, registerRequest("example.test")))
+			if resp[0] != tt.want {
+				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
+			}
+			if gotMenu := ap.calls > 0; gotMenu != tt.wantMenu {
+				t.Fatalf("approval menu shown %d times, want shown=%v", ap.calls, tt.wantMenu)
+			}
+			if uv.calls != 1 {
+				t.Fatalf("verifier ran %d times, want 1", uv.calls)
+			}
+			if stored := len(store.creds) == 1; stored != (tt.want == statusOK) {
+				t.Fatalf("%d credentials stored after status 0x%02x", len(store.creds), resp[0])
+			}
+		})
+	}
+}
+
 func TestGetInfoAdvertisesPasskeys(t *testing.T) {
 	a := newTestAuthenticator(t, &memStore{}, fakeApprover{}, nil)
 	resp := a.Handle(context.Background(), []byte{ctapGetInfo})
