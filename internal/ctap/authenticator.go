@@ -107,11 +107,8 @@ type Authenticator struct {
 }
 
 // New builds an Authenticator from cfg. Store, Approver and Notifier are
-// required. log records every decision; nil discards it.
+// required. log records every decision.
 func New(log *zap.Logger, cfg Config) *Authenticator {
-	if log == nil {
-		log = zap.NewNop()
-	}
 	return &Authenticator{
 		store:              cfg.Store,
 		approver:           cfg.Approver,

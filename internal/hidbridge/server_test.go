@@ -152,7 +152,7 @@ func TestCancelEndsActiveSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(nil, os.Getuid(), func() (Device, error) { return dev, nil })
+	srv := NewServer(zaptest.NewLogger(t), os.Getuid(), func() (Device, error) { return dev, nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()

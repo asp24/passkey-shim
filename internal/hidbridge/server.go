@@ -33,11 +33,8 @@ type Server struct {
 // HID device when a client connects, so a missing device is reported before
 // the client asks for a passphrase; it must not make anything visible to the
 // host, Create does that. log records rejected clients and sessions that end
-// abnormally; nil discards them.
+// abnormally.
 func NewServer(log *zap.Logger, uid int, openDevice func() (Device, error)) *Server {
-	if log == nil {
-		log = zap.NewNop()
-	}
 	return &Server{uid: uid, openDevice: openDevice, log: log}
 }
 
