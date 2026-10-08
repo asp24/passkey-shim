@@ -24,15 +24,21 @@ type Device interface {
 
 // Server relays FIDO reports between one client and one Device at a time.
 type Server struct {
-	// UID is the only user allowed to connect.
-	UID int
-	// OpenDevice prepares the HID device when a client connects, so a
-	// missing device is reported before the client asks for a passphrase.
-	// It must not make anything visible to the host; Create does that.
-	OpenDevice func() (Device, error)
-	// Logger records rejected clients and sessions that end abnormally. Nil
-	// discards them.
-	Logger *zap.Logger
+	uid        int
+	openDevice func() (Device, error)
+	log        *zap.Logger
+}
+
+// NewServer returns a Server that accepts only uid. openDevice prepares the
+// HID device when a client connects, so a missing device is reported before
+// the client asks for a passphrase; it must not make anything visible to the
+// host, Create does that. log records rejected clients and sessions that end
+// abnormally; nil discards them.
+func NewServer(log *zap.Logger, uid int, openDevice func() (Device, error)) *Server {
+	if log == nil {
+		log = zap.NewNop()
+	}
+	return &Server{uid: uid, openDevice: openDevice, log: log}
 }
 
 // Listen creates the broker socket at path, reachable only by uid. It never
@@ -58,10 +64,7 @@ func Listen(path string, uid int) (*net.UnixListener, error) {
 // from other users, and any connection while a session is active, are
 // dropped. On return the listener is closed and no session is left running.
 func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
-	log := s.Logger
-	if log == nil {
-		log = zap.NewNop()
-	}
+	log := s.log
 	ctx, cancel := context.WithCancel(ctx)
 	var sessions sync.WaitGroup
 	defer sessions.Wait()
@@ -84,7 +87,7 @@ func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
 			conn.Close()
 			continue
 		}
-		if peer != uint32(s.UID) {
+		if peer != uint32(s.uid) {
 			log.Warn("rejected client from another user", zap.Uint32("uid", peer))
 			conn.Close()
 			continue
@@ -117,7 +120,7 @@ func (s *Server) Serve(ctx context.Context, listener *net.UnixListener) error {
 func (s *Server) relay(conn *net.UnixConn) error {
 	// Open the device up front, so a client on a machine where it cannot
 	// work hears so before it asks the user for a passphrase.
-	dev, err := s.OpenDevice()
+	dev, err := s.openDevice()
 	if err != nil {
 		_, _ = conn.Write([]byte{Unavailable})
 		return fmt.Errorf("opening device: %w", err)

@@ -87,7 +87,7 @@ func (a *app) serve(opts *serveCmd) error {
 		if opts.AutoApprove {
 			break // testing mode skips biometrics too
 		}
-		fv, err := fingerprint.New(a.desktop, a.log.Named("fingerprint"))
+		fv, err := fingerprint.New(a.log.Named("fingerprint"), a.desktop)
 		if err != nil {
 			a.log.Warn("fingerprint verification unavailable; the desktop prompt is the only check "+
 				"(pass --uv prompt to silence this)", zap.Error(err))
@@ -120,7 +120,7 @@ func (a *app) serve(opts *serveCmd) error {
 		a.log.Info("repeat requests from the same site reuse the previous scan", zap.Duration("grace", opts.UVGrace))
 	}
 
-	auth := ctap.New(ctap.Config{
+	auth := ctap.New(a.log.Named("ctap"), ctap.Config{
 		Store:              vaultStore{v},
 		Approver:           ap,
 		Verifier:           verifier,
@@ -129,7 +129,6 @@ func (a *app) serve(opts *serveCmd) error {
 		FingerprintConsent: fingerprintConsent,
 		UVGrace:            opts.UVGrace,
 		AAGUID:             aaguid,
-		Logger:             a.log.Named("ctap"),
 	})
 
 	// Signals are caught only from here on. Before this point Ctrl+C must
@@ -154,7 +153,7 @@ func (a *app) serve(opts *serveCmd) error {
 	// Requests get their own context so that leaving the loop for any reason
 	// closes an open prompt before stack.Wait waits for it.
 	reqCtx, cancelRequests := context.WithCancel(ctx)
-	stack := ctaphid.New(dev, auth.Handle, a.log.Named("ctaphid"))
+	stack := ctaphid.New(a.log.Named("ctaphid"), dev, auth.Handle)
 	defer stack.Wait()
 	defer cancelRequests()
 

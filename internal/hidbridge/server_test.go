@@ -75,7 +75,7 @@ func startServer(t *testing.T, openDevice func() (Device, error)) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{UID: os.Getuid(), OpenDevice: openDevice, Logger: zaptest.NewLogger(t)}
+	srv := NewServer(zaptest.NewLogger(t), os.Getuid(), openDevice)
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()
@@ -152,7 +152,7 @@ func TestCancelEndsActiveSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{UID: os.Getuid(), OpenDevice: func() (Device, error) { return dev, nil }}
+	srv := NewServer(nil, os.Getuid(), func() (Device, error) { return dev, nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()
@@ -360,7 +360,7 @@ func TestSessionReportsDeviceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	dev := brokenDevice{newFakeDevice()}
-	srv := &Server{UID: os.Getuid(), OpenDevice: func() (Device, error) { return dev, nil }, Logger: zap.New(core)}
+	srv := NewServer(zap.New(core), os.Getuid(), func() (Device, error) { return dev, nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, listener) }()

@@ -79,7 +79,7 @@ func newTestTransport(t *testing.T, onCBOR func(context.Context, []byte) []byte)
 	if onCBOR == nil {
 		onCBOR = func(context.Context, []byte) []byte { return nil }
 	}
-	tr := New(rec, onCBOR, zaptest.NewLogger(t))
+	tr := New(zaptest.NewLogger(t), rec, onCBOR)
 	t.Cleanup(tr.Wait)
 	return tr, rec
 }

@@ -50,7 +50,7 @@ type Verifier struct {
 // New checks that fprintd has a sensor with a finger enrolled for the current
 // user, so a missing enrolment shows up at startup rather than at the first
 // sign-in.
-func New(prompter Prompter, log *zap.Logger) (*Verifier, error) {
+func New(log *zap.Logger, prompter Prompter) (*Verifier, error) {
 	u, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("looking up current user: %w", err)

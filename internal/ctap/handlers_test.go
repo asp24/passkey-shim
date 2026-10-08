@@ -121,14 +121,14 @@ type nopNotifier struct{}
 func (nopNotifier) Notify(string, string) {}
 
 func newTestAuthenticator(t *testing.T, store Store, ap Approver, uv UserVerifier, mutate ...func(*Config)) *Authenticator {
-	cfg := Config{Store: store, Approver: ap, Notifier: nopNotifier{}, AAGUID: [16]byte{1, 2, 3}, Logger: zaptest.NewLogger(t)}
+	cfg := Config{Store: store, Approver: ap, Notifier: nopNotifier{}, AAGUID: [16]byte{1, 2, 3}}
 	if uv != nil {
 		cfg.Verifier = uv
 	}
 	for _, m := range mutate {
 		m(&cfg)
 	}
-	return New(cfg)
+	return New(zaptest.NewLogger(t), cfg)
 }
 
 func clientDataHash(s string) []byte {

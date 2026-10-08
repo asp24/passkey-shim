@@ -86,8 +86,6 @@ type Config struct {
 	UVGrace time.Duration
 	// AAGUID identifies the authenticator model.
 	AAGUID [16]byte
-	// Logger records every decision. Nil discards it.
-	Logger *zap.Logger
 }
 
 // Authenticator handles CTAP2 commands. Handle is safe to call from several
@@ -109,9 +107,8 @@ type Authenticator struct {
 }
 
 // New builds an Authenticator from cfg. Store, Approver and Notifier are
-// required.
-func New(cfg Config) *Authenticator {
-	log := cfg.Logger
+// required. log records every decision; nil discards it.
+func New(log *zap.Logger, cfg Config) *Authenticator {
 	if log == nil {
 		log = zap.NewNop()
 	}

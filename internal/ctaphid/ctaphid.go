@@ -100,7 +100,7 @@ type Transport struct {
 // New returns a Transport that answers through dev and passes each CTAP2
 // message to onCBOR, whose return value is sent back as the response. Frames
 // are logged at debug level, transport faults at warn.
-func New(dev ReportSender, onCBOR func(context.Context, []byte) []byte, log *zap.Logger) *Transport {
+func New(log *zap.Logger, dev ReportSender, onCBOR func(context.Context, []byte) []byte) *Transport {
 	return &Transport{
 		dev:     dev,
 		pending: make(map[uint32]*assembly),
