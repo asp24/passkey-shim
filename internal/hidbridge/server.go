@@ -46,13 +46,15 @@ func Listen(path string, uid int) (*net.UnixListener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listening on %s: %w", path, err)
 	}
-	if err := os.Chown(path, uid, -1); err != nil {
-		listener.Close()
-		return nil, fmt.Errorf("handing %s to uid %d: %w", path, uid, err)
-	}
+	// Restrict before handing over: once uid owns the socket, changing its
+	// mode needs CAP_FOWNER, which the broker's unit does not grant.
 	if err := os.Chmod(path, 0o600); err != nil {
 		listener.Close()
 		return nil, fmt.Errorf("restricting %s: %w", path, err)
+	}
+	if err := os.Chown(path, uid, -1); err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("handing %s to uid %d: %w", path, uid, err)
 	}
 	return listener, nil
 }
