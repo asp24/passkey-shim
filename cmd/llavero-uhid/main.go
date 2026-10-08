@@ -7,33 +7,41 @@ package main
 
 import (
 	"context"
-	"flag"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 
 	"go.uber.org/zap"
 
+	"llavero/internal/bootstrap"
 	"llavero/internal/hidbridge"
 	"llavero/internal/hidbridge/kernel"
 	"llavero/internal/logging"
 )
 
-func main() {
-	uidFlag := flag.String("uid", "", "numeric UID allowed to connect (required)")
-	flag.Parse()
-	uid, err := strconv.ParseUint(*uidFlag, 10, 32)
-	if err != nil || uid == 0 {
-		fatal("-uid must name a non-root numeric UID")
+type options struct {
+	UID uint32 `long:"uid" required:"yes" description:"numeric UID allowed to connect"`
+}
+
+// Finalize rejects root: the broker exists to hand the device to a user.
+func (o *options) Finalize() error {
+	if o.UID == 0 {
+		return errors.New("--uid must name a non-root numeric UID")
 	}
+	return nil
+}
+
+func main() {
+	opts := bootstrap.MustParseConfig[options]()
+	uid := opts.UID
 	if os.Geteuid() != 0 {
 		fatal("must run as root")
 	}
-	log := logging.New(false).Named("broker").With(zap.Uint64("uid", uid))
+	log := logging.New(false).Named("broker").With(zap.Uint32("uid", uid))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	err = serve(ctx, int(uid), log, kernel.Check)
+	err := serve(ctx, int(uid), log, kernel.Check)
 	stop()
 	if err != nil {
 		log.Error("broker stopped", zap.Error(err))

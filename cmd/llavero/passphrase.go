@@ -29,7 +29,7 @@ func readPassphrase(passFD int, confirm bool, adjective string) ([]byte, error) 
 	}
 
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		return nil, errors.New("no terminal to read the passphrase from (use -passphrase-fd)")
+		return nil, errors.New("no terminal to read the passphrase from (use --passphrase-fd)")
 	}
 
 	if confirm {

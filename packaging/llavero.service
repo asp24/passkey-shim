@@ -13,12 +13,12 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-# -uv-strict: if the fingerprint sensor cannot be used, DENY rather than
+# --uv-strict: if the fingerprint sensor cannot be used, DENY rather than
 # falling back to the desktop prompt alone. This matters because a TPM-unlocked
 # vault opens without any typing, so the fingerprint is the only thing standing
 # between a passing stranger at an unlocked laptop and your accounts.
 # Drop the flag if a wedged sensor ever locks you out and you need to work.
-ExecStart=%h/.local/bin/llavero -uv fingerprint -uv-strict -consent fingerprint
+ExecStart=%h/.local/bin/llavero serve --uv fingerprint --uv-strict --consent fingerprint
 
 Restart=on-failure
 RestartSec=5

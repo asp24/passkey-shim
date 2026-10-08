@@ -9,7 +9,7 @@ import (
 )
 
 // readLine must stop at the newline and leave the rest of the stream for the
-// next reader, which is how -passphrase-fd feeds a passphrase and its
+// next reader, which is how --passphrase-fd feeds a passphrase and its
 // confirmation through one pipe.
 func TestReadLineLeavesTheRest(t *testing.T) {
 	tests := []struct {

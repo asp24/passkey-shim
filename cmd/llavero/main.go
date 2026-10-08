@@ -6,17 +6,12 @@
 package main
 
 import (
-	"flag"
-	"fmt"
-	"os"
-	"time"
-
 	"go.uber.org/zap"
 
-	"llavero/internal/approval"
+	"llavero/internal/bootstrap"
+	"llavero/internal/hardening"
 	"llavero/internal/logging"
 	"llavero/internal/notify"
-	"llavero/internal/tpm"
 	"llavero/internal/vault"
 )
 
@@ -27,68 +22,51 @@ var aaguid = [16]byte{
 	0xa7, 0x60, 0xc3, 0x18, 0xe5, 0x02, 0xbb, 0x46,
 }
 
-// app carries the parsed options and the dependencies every command shares.
+func main() {
+	bootstrap.MustRunCommand(
+		serveCommand(),
+		listCommand(),
+		forgetCommand(),
+		rekeyCommand(),
+		tpmSelftestCommand(),
+	)
+}
+
+// app carries the vault options and the dependencies every vault command shares.
 type app struct {
-	opts options
+	opts *vaultOptions
 	log  *zap.Logger
 	// desktop is shared by every component that talks to the user, so a
 	// sticky prompt raised by one can be replaced or dismissed by another.
 	desktop *notify.Desktop
 }
 
-type options struct {
-	vaultPath   string
-	unlock      string
-	rekeyTo     string
-	uv          string
-	uvStrict    bool
-	consent     string
-	uvGrace     time.Duration
-	list        bool
-	forget      string
-	mlock       bool
-	autoApprove bool
-	approval    string
-	passFD      int
-	newPassFD   int
+type logOptions struct {
+	Verbose bool `short:"v" long:"verbose" description:"log debug detail, including every CTAPHID frame under serve"`
 }
 
-func main() {
-	var (
-		opts        options
-		tpmSelftest = flag.Bool("tpm-selftest", false, "seal and unseal a test secret, then exit")
-		verboseFlag = flag.Bool("v", false, "log every CTAPHID frame")
-	)
-	flag.StringVar(&opts.vaultPath, "vault", vault.DefaultPath(), "path to the encrypted vault file")
-	flag.StringVar(&opts.unlock, "unlock", "passphrase", "unlock mode for a NEW vault: passphrase, tpm, or tpm+passphrase")
-	flag.StringVar(&opts.rekeyTo, "rekey", "", "re-encrypt an existing vault under this unlock mode, then exit")
-	flag.StringVar(&opts.uv, "uv", "fingerprint", "user verification: fingerprint or prompt")
-	flag.BoolVar(&opts.uvStrict, "uv-strict", false, "deny when the fingerprint sensor is unusable instead of falling back to the prompt")
-	flag.StringVar(&opts.consent, "consent", "prompt", "how to take consent: prompt (click to approve, then touch) or fingerprint (touch only)")
-	flag.DurationVar(&opts.uvGrace, "uv-grace", 5*time.Second, "reuse a just-completed fingerprint scan for repeat requests from the SAME site (0 disables)")
-	flag.BoolVar(&opts.mlock, "mlock", true, "lock memory so keys cannot be written to swap")
-	flag.BoolVar(&opts.list, "list", false, "list stored passkeys, then exit")
-	flag.StringVar(&opts.forget, "forget", "", "delete passkeys matching a site or a credential id prefix, then exit")
-	flag.StringVar(&opts.approval, "approval", approval.BackendAuto, "approval prompt: auto, omarchy or zenity")
-	flag.BoolVar(&opts.autoApprove, "auto-approve", false, "approve every request without prompting (testing only)")
-	flag.IntVar(&opts.passFD, "passphrase-fd", -1, "read the vault passphrase from this file descriptor")
-	flag.IntVar(&opts.newPassFD, "new-passphrase-fd", -1, "read the NEW passphrase for -rekey from this file descriptor")
-	flag.Parse()
+// vaultOptions are embedded by every command that opens the vault.
+type vaultOptions struct {
+	logOptions
 
-	log := logging.New(*verboseFlag)
-	a := &app{opts: opts, log: log, desktop: &notify.Desktop{}}
+	VaultPath string `long:"vault" value-name:"PATH" description:"path to the encrypted vault file (default: the per-user data directory)"`
+	PassFD    int    `long:"passphrase-fd" value-name:"FD" default:"-1" description:"read the vault passphrase from this file descriptor"`
+	NoMlock   bool   `long:"no-mlock" description:"do not lock memory, letting keys be written to swap"`
+}
 
-	var err error
-	if *tpmSelftest {
-		err = tpm.SelfTest(log.Named("tpm"))
-	} else {
-		err = a.run()
+// Finalize fills in the defaults that are computed rather than constant.
+func (o *vaultOptions) Finalize() error {
+	if o.VaultPath == "" {
+		o.VaultPath = vault.DefaultPath()
 	}
-	_ = log.Sync()
-	if err != nil {
-		// The final error is addressed to the person at the terminal and may
-		// span several lines of advice, so it is printed rather than logged.
-		fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
-		os.Exit(1)
-	}
+	return nil
+}
+
+// withApp builds the shared dependencies and runs fn with them. Core dumps
+// and ptrace are shut off first, before anything is decrypted.
+func (o *vaultOptions) withApp(fn func(a *app) error) error {
+	log := logging.New(o.Verbose)
+	defer func() { _ = log.Sync() }()
+	hardening.Apply(!o.NoMlock, log.Named("hardening"))
+	return fn(&app{opts: o, log: log, desktop: &notify.Desktop{}})
 }

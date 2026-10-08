@@ -11,7 +11,7 @@ TPM, and every use requires a fingerprint.
 *Llavero* is Spanish for keyring.
 
 ```
-$ llavero -list
+$ llavero list
 SITE                  ACCOUNT          CREDENTIAL         USES  CREATED
 dash.cloudflare.com   89fd29a150f3...  e2f02eed7cb9df6b      8  2026-09-17 20:54
 webauthn.io           alice            42e0a5c37ed7ef9e      7  2026-09-17 19:53
@@ -81,7 +81,7 @@ Then:
 
 ```sh
 go build -o llavero ./cmd/llavero && install -m755 llavero ~/.local/bin/
-llavero -unlock tpm          # creates the vault, no passphrase needed
+llavero serve --unlock tpm    # creates the vault, no passphrase needed; Ctrl+C once it is up
 systemctl --user enable --now llavero.service
 ```
 
@@ -98,23 +98,23 @@ descriptor, tags the node `uaccess`, and grants the logged-in user an ACL.
 | `tpm+passphrase` | both | no |
 
 The mode is recorded in the vault header, so the daemon only asks for what that
-vault actually needs. Migrate between modes with `-rekey`, which backs the file
+vault actually needs. Migrate between modes with `llavero rekey`, which backs the file
 up first and refuses to report success until the rewritten vault reopens with
 the expected credential count:
 
 ```sh
-llavero -rekey tpm
+llavero rekey tpm
 ```
 
 ### Managing passkeys
 
 ```sh
-llavero -list                    # what is stored
-llavero -forget dash.example.com # delete by site
-llavero -forget 02fe624b         # or by credential id prefix
+llavero list                    # what is stored
+llavero forget dash.example.com # delete by site
+llavero forget 02fe624b         # or by credential id prefix
 ```
 
-`-forget` shows what it will delete and asks you to type the site name back.
+`forget` shows what it will delete and asks you to type the site name back.
 It refuses to run while the service has that same vault open, because the
 daemon holds its own copy in memory and its next write would resurrect
 anything deleted underneath it.
@@ -131,7 +131,7 @@ than the live vault:
 ```sh
 cp ~/.local/share/llavero/vault.pkv     /tmp/portable.pkv
 cp ~/.local/share/llavero/vault.pkv.tpm /tmp/portable.pkv.tpm
-llavero -vault /tmp/portable.pkv -rekey passphrase
+llavero rekey --vault /tmp/portable.pkv passphrase
 rm /tmp/portable.pkv.tpm /tmp/portable.pkv.bak-*
 ```
 
@@ -143,24 +143,42 @@ Store it somewhere you would store a recovery code, and redo it after
 registering a passkey you care about. Verify it with:
 
 ```sh
-llavero -vault /tmp/portable.pkv -list
+llavero list --vault /tmp/portable.pkv
 ```
 
-### Flags
+### Commands and flags
 
-| Flag | Meaning |
+`llavero <command> [flags]`; `llavero <command> --help` lists everything a
+command takes.
+
+| Command | Meaning |
 |---|---|
-| `-vault PATH` | vault file location |
-| `-unlock MODE` | unlock mode for a **new** vault |
-| `-rekey MODE` | re-encrypt an existing vault, then exit |
-| `-approval auto\|omarchy\|zenity` | approval dialog: `auto` uses Omarchy's picker if installed, otherwise zenity (GNOME and other GTK desktops) |
-| `-uv fingerprint\|prompt` | user verification method |
-| `-uv-strict` | deny when the sensor is unusable, instead of falling back |
-| `-passphrase-fd N` | read the passphrase from a descriptor (`0` for stdin) |
-| `-mlock` | lock memory against swap (default true, degrades with a warning) |
-| `-tpm-selftest` | seal and unseal a test secret, then exit |
-| `-auto-approve` | approve everything without prompting. Testing only |
-| `-v` | log every CTAPHID frame |
+| `serve` | run the authenticator; creates the vault on first start |
+| `list` | list stored passkeys |
+| `forget SITE\|ID` | delete passkeys by site or credential id prefix |
+| `rekey MODE` | re-encrypt the vault under another unlock mode |
+| `tpm-selftest` | seal and unseal a test secret |
+
+Every command except `tpm-selftest` takes the vault flags:
+
+| Vault flag | Meaning |
+|---|---|
+| `--vault PATH` | vault file location |
+| `--passphrase-fd N` | read the passphrase from a descriptor (`0` for stdin) |
+| `--no-mlock` | do not lock memory against swap (locking is on by default and degrades with a warning) |
+| `-v`, `--verbose` | log debug detail, including every CTAPHID frame under `serve` (`tpm-selftest` takes it too) |
+
+| `serve` flag | Meaning |
+|---|---|
+| `--unlock MODE` | unlock mode if the vault does not exist yet |
+| `--approval auto\|omarchy\|zenity` | approval dialog: `auto` uses Omarchy's picker if installed, otherwise zenity (GNOME and other GTK desktops) |
+| `--uv fingerprint\|prompt` | user verification method |
+| `--uv-strict` | deny when the sensor is unusable, instead of falling back |
+| `--consent prompt\|fingerprint` | click to approve then touch, or touch only |
+| `--uv-grace DURATION` | reuse a fresh scan for repeat requests from the same site |
+| `--auto-approve` | approve everything without prompting. Testing only |
+
+`rekey` also takes `--new-passphrase-fd N` for the new passphrase.
 
 ## Security model
 
@@ -196,7 +214,7 @@ What this does **not** protect against:
 
 - **Malware already running as you.** It can ask the TPM to unseal, exactly as
   the daemon does. The fingerprint prompt is the backstop, which is why the
-  service runs with `-uv-strict`.
+  service runs with `--uv-strict`.
 - **Losing the machine's TPM.** A cleared TPM, a board replacement, or a wiped
   `~/.local/share/llavero/` means the passkeys are gone. Keep another
   sign-in method on anything that matters, and back up the vault plus its
@@ -218,7 +236,7 @@ process by the time the protections are in place:
   is no `/proc` file exposing it and the ownership of `/proc/[pid]` is not the
   indicator it is commonly assumed to be.
 - **Memory is locked** with `mlockall(MCL_CURRENT|MCL_FUTURE)` so pages holding
-  keys cannot be written to swap. `-mlock=false` turns this off.
+  keys cannot be written to swap. `--no-mlock` turns this off.
 
 None of these are fatal if they fail. A machine that refuses one is still
 better served by a working authenticator, and the log says exactly what did not
@@ -246,14 +264,14 @@ Skipping all of this is reasonable if your swap sits on an encrypted volume,
 which already covers the threat that locking memory addresses. The daemon says
 so in the warning it logs.
 
-### A note on `-uv-strict`
+### A note on `--uv-strict`
 
 With the flag, a sensor that cannot be reached denies the request. Without it,
 the daemon falls back to the desktop approval you just gave and logs loudly.
 
 The installed service sets it. This laptop's fingerprint reader is known to
 wedge after suspend when USB re-enumerates, so if that ever locks you out, drop
-the flag from the unit or run the daemon by hand with `-uv prompt` until the
+the flag from the unit or run the daemon by hand with `llavero serve --uv prompt` until the
 sensor is fixed. Failing closed is the right default for a vault that unlocks
 itself at login.
 
@@ -265,7 +283,7 @@ cancel itself out across both sides.
 
 ```sh
 go build -o llavero ./cmd/llavero && go build -o ctaptest ./cmd/ctaptest
-./llavero -vault /tmp/test.pkv -auto-approve -passphrase-fd 0 <<< 'testpass123' &
+./llavero serve --vault /tmp/test.pkv --passphrase-fd 0 --auto-approve <<< 'testpass123' &
 ./ctaptest /dev/hidrawN        # the daemon logs which node it became
 ```
 
@@ -274,10 +292,10 @@ signature against the public key from registration. It also checks a negative
 control (a wrong challenge must fail), that the signature counter advances, and
 that an unregistered relying party gets `NO_CREDENTIALS`.
 
-Pass `-state FILE` to register in one run and verify in a later one, which is
+Pass `--state FILE` to register in one run and verify in a later one, which is
 how the across-restart and across-rekey checks work.
 
-`llavero -tpm-selftest` exercises the TPM path on its own: seal, unseal,
+`llavero tpm-selftest` exercises the TPM path on its own: seal, unseal,
 confirm two seals differ, and confirm a corrupted blob is rejected.
 
 
@@ -363,9 +381,9 @@ of the vault and, more importantly, avoids asking for a fingerprint that
 authorises nothing.
 
 Clients also fire two `getAssertion` calls milliseconds apart for a single
-sign-in. `-uv-grace` (default 5s) lets the second reuse the scan the first just
+sign-in. `--uv-grace` (default 5s) lets the second reuse the scan the first just
 completed, scoped to the same site, so one sign-in costs one touch. Set
-`-uv-grace 0` to require a scan every time.
+`--uv-grace 0` to require a scan every time.
 
 ## Not implemented
 

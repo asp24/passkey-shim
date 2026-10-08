@@ -15,29 +15,39 @@ import (
 	"go.uber.org/zap"
 
 	"llavero/internal/approval"
+	"llavero/internal/bootstrap"
 	"llavero/internal/ctap"
 	"llavero/internal/ctaphid"
 	"llavero/internal/fingerprint"
-	"llavero/internal/hardening"
 	"llavero/internal/hidbridge"
 )
 
-func (a *app) run() error {
-	opts := a.opts
-	// Before anything touches a key. Core dumps and ptrace are shut off first
-	// so there is no window in which a decrypted vault could escape.
-	hardening.Apply(opts.mlock, a.log.Named("hardening"))
+func serveCommand() bootstrap.Command {
+	return bootstrap.Command{
+		Name:        "serve",
+		Description: "run the authenticator, creating the vault on first start",
+		Options:     &serveCmd{},
+	}
+}
 
-	if opts.rekeyTo != "" {
-		return a.runRekey()
-	}
-	if opts.list {
-		return a.runList()
-	}
-	if opts.forget != "" {
-		return a.runForget()
-	}
+type serveCmd struct {
+	vaultOptions
 
+	Unlock      string        `long:"unlock" value-name:"MODE" default:"passphrase" description:"unlock mode if the vault does not exist yet: passphrase, tpm, or tpm+passphrase"`
+	UV          string        `long:"uv" default:"fingerprint" choice:"fingerprint" choice:"prompt" description:"user verification method"`
+	UVStrict    bool          `long:"uv-strict" description:"deny when the fingerprint sensor is unusable instead of falling back to the prompt"`
+	Consent     string        `long:"consent" default:"prompt" choice:"prompt" choice:"fingerprint" description:"how to take consent: prompt (click to approve, then touch) or fingerprint (touch only)"`
+	UVGrace     time.Duration `long:"uv-grace" value-name:"DURATION" default:"5s" description:"reuse a just-completed fingerprint scan for repeat requests from the SAME site (0 disables)"`
+	Approval    string        `long:"approval" default:"auto" choice:"auto" choice:"omarchy" choice:"zenity" description:"approval prompt"`
+	AutoApprove bool          `long:"auto-approve" description:"approve every request without prompting (testing only)"`
+}
+
+func (c *serveCmd) Execute([]string) error {
+	return c.withApp(func(a *app) error { return a.serve(c) })
+}
+
+// serve runs the authenticator until it is told to stop.
+func (a *app) serve(opts *serveCmd) error {
 	// Connect to the broker before asking for a passphrase, so a missing
 	// system service does not cost the user a typed secret first.
 	dev, err := hidbridge.Dial(hidbridge.SocketPath(os.Getuid()), 0)
@@ -51,20 +61,20 @@ func (a *app) run() error {
 	}
 	defer dev.Close()
 
-	v, err := a.loadVault()
+	v, err := a.loadVault(opts.Unlock)
 	if err != nil {
 		return err // loadVault's errors already say what failed
 	}
 
 	var ap ctap.Approver
-	if opts.autoApprove {
-		a.log.Warn("-auto-approve is set: every request will be granted without asking")
+	if opts.AutoApprove {
+		a.log.Warn("--auto-approve is set: every request will be granted without asking")
 		ap = approval.Auto{}
 	} else {
-		ap, err = approval.New(opts.approval)
+		ap, err = approval.New(opts.Approval)
 		if err != nil {
 			return fmt.Errorf("no approval UI available: %w\n"+
-				"       (install zenity or omarchy-menu-select, or run with -auto-approve for testing)", err)
+				"       (install zenity or omarchy-menu-select, or run with --auto-approve for testing)", err)
 		}
 		a.log.Info("approval prompt", zap.String("backend", fmt.Sprintf("%T", ap)))
 	}
@@ -72,42 +82,42 @@ func (a *app) run() error {
 	// Keep this an interface and assign it only on success: a nil
 	// *fingerprint.Verifier stored here would compare non-nil.
 	var verifier ctap.UserVerifier
-	switch opts.uv {
+	switch opts.UV {
 	case "fingerprint":
-		if opts.autoApprove {
+		if opts.AutoApprove {
 			break // testing mode skips biometrics too
 		}
 		fv, err := fingerprint.New(a.desktop, a.log.Named("fingerprint"))
 		if err != nil {
 			a.log.Warn("fingerprint verification unavailable; the desktop prompt is the only check "+
-				"(pass -uv prompt to silence this)", zap.Error(err))
+				"(pass --uv prompt to silence this)", zap.Error(err))
 			break
 		}
 		verifier = fv
 	case "prompt":
 		a.log.Info("user verification is the desktop prompt alone")
 	default:
-		return fmt.Errorf("unknown -uv value %q (want fingerprint or prompt)", opts.uv)
+		return fmt.Errorf("unknown --uv value %q (want fingerprint or prompt)", opts.UV)
 	}
 
 	fingerprintConsent := false
-	switch opts.consent {
+	switch opts.Consent {
 	case "prompt":
 	case "fingerprint":
 		if verifier == nil {
 			// Without a sensor this would leave no user interaction at all, so
 			// fall back rather than let a page mint passkeys in silence.
-			a.log.Warn("-consent fingerprint needs a working sensor; falling back to the approval prompt")
+			a.log.Warn("--consent fingerprint needs a working sensor; falling back to the approval prompt")
 		} else {
 			fingerprintConsent = true
 			a.log.Info("consent is the fingerprint touch alone; no approval click")
 		}
 	default:
-		return fmt.Errorf("unknown -consent value %q (want prompt or fingerprint)", opts.consent)
+		return fmt.Errorf("unknown --consent value %q (want prompt or fingerprint)", opts.Consent)
 	}
 
-	if opts.uvGrace > 0 && verifier != nil {
-		a.log.Info("repeat requests from the same site reuse the previous scan", zap.Duration("grace", opts.uvGrace))
+	if opts.UVGrace > 0 && verifier != nil {
+		a.log.Info("repeat requests from the same site reuse the previous scan", zap.Duration("grace", opts.UVGrace))
 	}
 
 	auth := ctap.New(ctap.Config{
@@ -115,9 +125,9 @@ func (a *app) run() error {
 		Approver:           ap,
 		Verifier:           verifier,
 		Notifier:           a.desktop,
-		StrictUV:           opts.uvStrict,
+		StrictUV:           opts.UVStrict,
 		FingerprintConsent: fingerprintConsent,
-		UVGrace:            opts.uvGrace,
+		UVGrace:            opts.UVGrace,
 		AAGUID:             aaguid,
 		Logger:             a.log.Named("ctap"),
 	})

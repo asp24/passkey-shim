@@ -96,7 +96,7 @@ func lockAllMemory(log *zap.Logger) string {
 	// first and decline rather than arm a landmine.
 	if err := unix.Mlockall(unix.MCL_CURRENT | unix.MCL_FUTURE); err != nil {
 		log.Warn("could not lock memory; keys may be written to swap. Raise it with "+
-			"LimitMEMLOCK=64M in the systemd unit, or pass -mlock=false to stop trying "+
+			"LimitMEMLOCK=64M in the systemd unit, or pass --no-mlock to stop trying "+
 			"(harmless if your swap is on an encrypted volume)",
 			zap.String("memlock_limit", describeLimit(lim.Cur)), zap.Error(err))
 		return ""

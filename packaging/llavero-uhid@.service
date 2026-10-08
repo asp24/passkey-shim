@@ -6,7 +6,7 @@ After=systemd-modules-load.service
 
 [Service]
 Type=simple
-ExecStart=/usr/lib/llavero/llavero-uhid -uid %i
+ExecStart=/usr/lib/llavero/llavero-uhid --uid %i
 RuntimeDirectory=llavero-uhid-%i
 RuntimeDirectoryMode=0755
 Restart=on-failure

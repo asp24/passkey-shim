@@ -17,7 +17,7 @@ enforces it.
    real origin).
 2. Print the RP ID being registered in the first PASS line.
 3. In README, state that ctaptest writes to whatever vault the daemon has
-   open, and show cleanup: `llavero -forget ctaptest.invalid`.
+   open, and show cleanup: `llavero forget ctaptest.invalid`.
 
 ## Done when
 

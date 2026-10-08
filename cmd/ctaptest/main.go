@@ -16,11 +16,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 
 	"github.com/fxamacker/cbor/v2"
+
+	"llavero/internal/bootstrap"
 )
 
 // savedRegistration lets a later run verify against a credential registered by
@@ -241,16 +242,18 @@ func p256Key(x, y []byte) (*ecdsa.PublicKey, error) {
 	return ecdsa.ParseUncompressedPublicKey(elliptic.P256(), append(append([]byte{0x04}, x...), y...))
 }
 
+type options struct {
+	StatePath string `long:"state" value-name:"FILE" description:"persist the registration here, and reuse it if the file already exists"`
+	Args      struct {
+		Device string `positional-arg-name:"/dev/hidrawN"`
+	} `positional-args:"yes" required:"yes"`
+}
+
 func main() {
-	statePath := flag.String("state", "", "persist the registration here, and reuse it if the file already exists")
-	flag.Parse()
-	if flag.NArg() < 1 {
-		fmt.Println("usage: ctaptest [-state file] /dev/hidrawN")
-		os.Exit(2)
-	}
-	f, err := os.OpenFile(flag.Arg(0), os.O_RDWR, 0)
+	opts := bootstrap.MustParseConfig[options]()
+	f, err := os.OpenFile(opts.Args.Device, os.O_RDWR, 0)
 	if err != nil {
-		fmt.Printf("FAIL  cannot open %s: %v\n", flag.Arg(0), err)
+		fmt.Printf("FAIL  cannot open %s: %v\n", opts.Args.Device, err)
 		os.Exit(1)
 	}
 	defer f.Close()
@@ -296,13 +299,13 @@ func main() {
 	// --- reuse a prior registration, if asked to --------------------------
 	var reg *parsedAuthData
 	reusing := false
-	if *statePath != "" {
-		if raw, err := os.ReadFile(*statePath); err == nil {
+	if opts.StatePath != "" {
+		if raw, err := os.ReadFile(opts.StatePath); err == nil {
 			var saved savedRegistration
 			if json.Unmarshal(raw, &saved) == nil {
 				pub, err := p256Key(saved.X, saved.Y)
 				if err != nil {
-					fail("saved registration in %s holds an invalid key: %v", *statePath, err)
+					fail("saved registration in %s holds an invalid key: %v", opts.StatePath, err)
 					os.Exit(1)
 				}
 				reg = &parsedAuthData{CredID: saved.CredID, PubKey: pub}
@@ -361,7 +364,7 @@ func main() {
 		pass("makeCredential      fmt=%s flags=0x%02x credId=%x…", mcResp.Fmt, reg.Flags, reg.CredID[:6])
 		pass("  public key        P-256, on curve, 32-byte coordinates")
 
-		if *statePath != "" {
+		if opts.StatePath != "" {
 			point, err := reg.PubKey.Bytes()
 			if err != nil {
 				fail("could not encode the public key for saving: %v", err)
@@ -369,7 +372,7 @@ func main() {
 			}
 			saved := savedRegistration{CredID: reg.CredID, X: point[1:33], Y: point[33:65]}
 			raw, _ := json.Marshal(saved)
-			if err := os.WriteFile(*statePath, raw, 0o600); err != nil {
+			if err := os.WriteFile(opts.StatePath, raw, 0o600); err != nil {
 				fail("could not save registration state: %v", err)
 			}
 		}

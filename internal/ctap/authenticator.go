@@ -196,7 +196,7 @@ func (a *Authenticator) requestConsent(ctx context.Context, rpID, title, affirma
 // approval the user just gave, because this laptop's fingerprint reader is
 // known to wedge after suspend, and a vault that locks you out of every
 // account until you reboot is a worse outcome than one that leans on the
-// prompt you already answered. Run with -uv-strict to invert that.
+// prompt you already answered. Run with --uv-strict to invert that.
 //
 // A cancelled request is never mistaken for a broken sensor: the lenient
 // fallback would otherwise approve a request the host already abandoned.
