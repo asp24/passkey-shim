@@ -27,6 +27,7 @@ const (
 	statusNotAllowed         = 0x30
 	statusUnsupportedOption  = 0x2B
 	statusKeepaliveCancel    = 0x2D // the host cancelled while we waited for the user
+	statusUVBlocked          = 0x3C // built-in verification cannot be used
 	statusOther              = 0x7F
 
 	// authData flag bits.

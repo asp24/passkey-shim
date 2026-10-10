@@ -151,36 +151,51 @@ func (a *Authenticator) consentIsFingerprint() bool {
 // denied is the status for a refused operation: KEEPALIVE_CANCEL when the
 // host cancelled the request while we waited, OPERATION_DENIED otherwise.
 func denied(ctx context.Context) []byte {
-	if ctx.Err() != nil {
-		return []byte{statusKeepaliveCancel}
-	}
-	return []byte{statusOperationDenied}
+	return []byte{deniedStatus(ctx)}
 }
 
-// requestConsent asks the user to approve an operation, returning false if they
-// declined, could not be asked, or the host cancelled. With fingerprint
-// consent the touch is the whole interaction; otherwise the menu runs first
-// and the touch confirms it.
+func deniedStatus(ctx context.Context) byte {
+	if ctx.Err() != nil {
+		return statusKeepaliveCancel
+	}
+	return statusOperationDenied
+}
+
+// approvedStatus maps a yes/no decision to statusOK or the refusal status.
+func approvedStatus(ctx context.Context, ok bool) byte {
+	if ok {
+		return statusOK
+	}
+	return deniedStatus(ctx)
+}
+
+// requestConsent asks the user to approve an operation and returns statusOK,
+// or the status to refuse it with if they declined, could not be asked, the
+// host cancelled, or strict verification met an unusable sensor. With
+// fingerprint consent the touch is the whole interaction; otherwise the menu
+// runs first and the touch confirms it.
 //
 // If the sensor turns out to be unusable under fingerprint consent, the menu
 // runs after all. Treating the broken sensor as approval, as verifyUserFor
 // does, would be wrong here: no prompt has been answered, so the request
 // would go through with no user interaction at all.
-func (a *Authenticator) requestConsent(ctx context.Context, rpID, title, affirmative, reason string) bool {
+func (a *Authenticator) requestConsent(ctx context.Context, rpID, title, affirmative, reason string) byte {
 	if !a.consentIsFingerprint() {
-		return a.confirm(ctx, title, affirmative, reason) && a.verifyUserFor(ctx, rpID, reason)
+		if !a.confirm(ctx, title, affirmative, reason) {
+			return deniedStatus(ctx)
+		}
+		return a.verifyUserFor(ctx, rpID, reason)
 	}
 	ok, err := a.scan(ctx, rpID, reason)
 	if err == nil {
-		return ok
+		return approvedStatus(ctx, ok)
 	}
 	if a.strictUV {
-		a.denyUnavailable(err)
-		return false
+		return a.denyUnavailable(err)
 	}
 	a.log.Warn("fingerprint unavailable; asking for approval on the desktop instead", zap.Error(err))
 	a.notifier.Notify("Fingerprint unavailable", "Approve on the desktop instead")
-	return a.confirm(ctx, title, affirmative, reason)
+	return approvedStatus(ctx, a.confirm(ctx, title, affirmative, reason))
 }
 
 // confirm shows the approval menu and reports whether the user picked
@@ -211,18 +226,19 @@ func (a *Authenticator) confirm(ctx context.Context, title, affirmative, reason 
 // known to wedge after suspend, and a vault that locks you out of every
 // account until you reboot is a worse outcome than one that leans on the
 // prompt you already answered. Run with --uv-strict to invert that.
-func (a *Authenticator) verifyUserFor(ctx context.Context, rpID, reason string) bool {
+//
+// It returns statusOK or the status to refuse the request with.
+func (a *Authenticator) verifyUserFor(ctx context.Context, rpID, reason string) byte {
 	ok, err := a.scan(ctx, rpID, reason)
 	if err == nil {
-		return ok
+		return approvedStatus(ctx, ok)
 	}
 	if a.strictUV {
-		a.denyUnavailable(err)
-		return false
+		return a.denyUnavailable(err)
 	}
 	a.log.Warn("fingerprint unavailable; accepting the desktop approval alone", zap.Error(err))
 	a.notifier.Notify("Fingerprint unavailable", "Approved on the desktop prompt alone")
-	return true
+	return statusOK
 }
 
 // scan runs the fingerprint check. A non-nil error means the sensor could not
@@ -263,10 +279,17 @@ func (a *Authenticator) scan(ctx context.Context, rpID, reason string) (bool, er
 }
 
 // denyUnavailable reports a request refused because strict verification is on
-// and the sensor could not be used.
-func (a *Authenticator) denyUnavailable(err error) {
+// and the sensor could not be used, and returns the status to refuse it with.
+//
+// That status is UV_BLOCKED, not OPERATION_DENIED. We advertise built-in UV
+// as a CTAP 2.0 key, and to such a key's host OPERATION_DENIED means "wrong
+// finger, try again": Firefox resends the request at once, and a sensor that
+// fails instantly turns that into hundreds of requests a second. UV_BLOCKED
+// says verification cannot happen at all, so the host gives up.
+func (a *Authenticator) denyUnavailable(err error) byte {
 	a.log.Warn("fingerprint unavailable; denying because strict verification is on", zap.Error(err))
 	a.notifier.Notify("Fingerprint unavailable", "Request denied")
+	return statusUVBlocked
 }
 
 // Handle decodes one CTAP2 message and returns the raw response, status byte
@@ -373,8 +396,8 @@ func (a *Authenticator) makeCredential(ctx context.Context, body []byte) []byte 
 	if label != "" {
 		reason = fmt.Sprintf("Create a passkey for %s as %s", req.RP.ID, label)
 	}
-	if !a.requestConsent(ctx, req.RP.ID, title, "Create passkey", reason) {
-		return denied(ctx)
+	if st := a.requestConsent(ctx, req.RP.ID, title, "Create passkey", reason); st != statusOK {
+		return []byte{st}
 	}
 	// The host may have given up while the user was approving. Storing the
 	// key then would leave a passkey the relying party never received.
@@ -455,8 +478,8 @@ func (a *Authenticator) getAssertion(ctx context.Context, body []byte) []byte {
 		chosen = matches[idx]
 		// Choosing an account is itself the consent, so only verification is
 		// left to do.
-		if !a.verifyUserFor(ctx, req.RPID, fmt.Sprintf("Sign in to %s as %s", req.RPID, labels[idx])) {
-			return denied(ctx)
+		if st := a.verifyUserFor(ctx, req.RPID, fmt.Sprintf("Sign in to %s as %s", req.RPID, labels[idx])); st != statusOK {
+			return []byte{st}
 		}
 	} else {
 		label := displayName(UserEntity{Name: chosen.UserName, DisplayName: chosen.UserDisplay})
@@ -468,8 +491,8 @@ func (a *Authenticator) getAssertion(ctx context.Context, body []byte) []byte {
 		if label != "" {
 			reason = fmt.Sprintf("Sign in to %s as %s", req.RPID, label)
 		}
-		if !a.requestConsent(ctx, req.RPID, title, "Sign in", reason) {
-			return denied(ctx)
+		if st := a.requestConsent(ctx, req.RPID, title, "Sign in", reason); st != statusOK {
+			return []byte{st}
 		}
 	}
 

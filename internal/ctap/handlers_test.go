@@ -339,7 +339,7 @@ func TestUserVerificationOutcomes(t *testing.T) {
 		{"finger matches", true, nil, false, statusOK},
 		{"finger does not match", false, nil, false, statusOperationDenied},
 		{"sensor broken, lenient", false, unavailable, false, statusOK},
-		{"sensor broken, strict", false, unavailable, true, statusOperationDenied},
+		{"sensor broken, strict", false, unavailable, true, statusUVBlocked},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -348,6 +348,45 @@ func TestUserVerificationOutcomes(t *testing.T) {
 			resp := a.Handle(context.Background(), command(t, ctapMakeCredential, registerRequest("example.test")))
 			if resp[0] != tt.want {
 				t.Fatalf("status 0x%02x, want 0x%02x", resp[0], tt.want)
+			}
+		})
+	}
+}
+
+// A strict refusal over a broken sensor must not read as a failed scan. Firefox
+// resends at once on OPERATION_DENIED from a key with built-in UV, so a sensor
+// that fails instantly would turn one sign-in into a flood of requests.
+func TestStrictUnavailableSensorEndsSignIn(t *testing.T) {
+	unavailable := errors.New("sensor wedged")
+	tests := []struct {
+		name        string
+		accounts    []string
+		fingerprint bool
+	}{
+		{"one account, approval menu", []string{"user-1"}, false},
+		{"one account, fingerprint consent", []string{"user-1"}, true},
+		{"account chooser", []string{"user-1", "user-2"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &memStore{}
+			setup := newTestAuthenticator(t, store, fakeApprover{}, nil)
+			for _, id := range tt.accounts {
+				req := registerRequest("example.test")
+				req.User.ID = []byte(id)
+				req.User.Name = id
+				if resp := setup.Handle(context.Background(), command(t, ctapMakeCredential, req)); resp[0] != statusOK {
+					t.Fatalf("registering %s: status 0x%02x", id, resp[0])
+				}
+			}
+
+			a := newTestAuthenticator(t, store, fakeApprover{}, &fakeVerifier{err: unavailable}, func(c *Config) {
+				c.StrictUV = true
+				c.FingerprintConsent = tt.fingerprint
+			})
+			resp := a.Handle(context.Background(), command(t, ctapGetAssertion, signRequest("example.test")))
+			if resp[0] != statusUVBlocked {
+				t.Fatalf("status 0x%02x, want UV_BLOCKED", resp[0])
 			}
 		})
 	}
@@ -411,7 +450,7 @@ func TestFingerprintConsentWithoutSensor(t *testing.T) {
 		{"finger does not match", false, nil, false, false, statusOperationDenied, false},
 		{"sensor broken, lenient, approved on the desktop", false, unavailable, false, false, statusOK, true},
 		{"sensor broken, lenient, declined on the desktop", false, unavailable, false, true, statusOperationDenied, true},
-		{"sensor broken, strict", false, unavailable, true, false, statusOperationDenied, false},
+		{"sensor broken, strict", false, unavailable, true, false, statusUVBlocked, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
